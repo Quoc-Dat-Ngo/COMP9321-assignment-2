@@ -1,0 +1,16 @@
+airline_id,name,iata_code,icao_code,country
+1,Qantas,QF,QFA,Australia
+2,Virgin Australia,VA,VOZ,Australia
+3,Jetstar Airways,JQ,JST,Australia
+4,Singapore Airlines,SQ,SIA,Singapore
+5,Emirates,EK,UAE,United Arab Emirates
+6,Qatar Airways,QR,QTR,Qatar
+7,Cathay Pacific,CX,CPA,Hong Kong
+8,Air New Zealand,NZ,ANZ,New Zealand
+9,British Airways,BA,BAW,United Kingdom
+10,Lufthansa,LH,DLH,Germany
+11,United Airlines,UA,UAL,United States
+12,American Airlines,AA,AAL,United States
+13,Delta Air Lines,DL,DAL,United States
+14,Air Canada,AC,ACA,Canada
+15,Japan Airlines,JL,JAL,Japan

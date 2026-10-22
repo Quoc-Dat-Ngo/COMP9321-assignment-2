@@ -1,0 +1,47 @@
+airport_id,name,city,country,iata_code,icao_code,latitude,longitude,altitude,timezone
+1,Sydney Kingsford Smith Airport,Sydney,Australia,SYD,YSSY,-33.9461,151.1772,6,Australia/Sydney
+2,Melbourne Airport,Melbourne,Australia,MEL,YMML,-37.669,144.841,168,Australia/Melbourne
+3,Brisbane Airport,Brisbane,Australia,BNE,YBBN,-27.3842,153.1175,4,Australia/Brisbane
+4,Perth Airport,Perth,Australia,PER,YPPH,-31.9403,115.9672,20,Australia/Perth
+5,Adelaide Airport,Adelaide,Australia,ADL,YPAD,-34.945,138.5306,6,Australia/Adelaide
+6,Canberra Airport,Canberra,Australia,CBR,YSCB,-35.3069,149.195,575,Australia/Sydney
+7,Auckland Airport,Auckland,New Zealand,AKL,NZAA,-37.0082,174.785,7,Pacific/Auckland
+8,Christchurch Airport,Christchurch,New Zealand,CHC,NZCH,-43.4894,172.532,37,Pacific/Auckland
+9,Wellington Airport,Wellington,New Zealand,WLG,NZWN,-41.3272,174.805,13,Pacific/Auckland
+10,Singapore Changi Airport,Singapore,Singapore,SIN,WSSS,1.3644,103.9915,7,Asia/Singapore
+11,Kuala Lumpur International Airport,Kuala Lumpur,Malaysia,KUL,WMKK,2.7456,101.7099,21,Asia/Kuala_Lumpur
+12,Bangkok Suvarnabhumi Airport,Bangkok,Thailand,BKK,VTBS,13.69,100.7501,2,Asia/Bangkok
+13,Tokyo Haneda Airport,Tokyo,Japan,HND,RJTT,35.5494,139.7798,6,Asia/Tokyo
+14,Tokyo Narita International Airport,Tokyo,Japan,NRT,RJAA,35.772,140.3929,41,Asia/Tokyo
+15,Osaka Kansai International Airport,Osaka,Japan,KIX,RJBB,34.4347,135.244,15,Asia/Tokyo
+16,Hong Kong International Airport,Hong Kong,Hong Kong,HKG,VHHH,22.308,113.9185,9,Asia/Hong_Kong
+17,Beijing Capital International Airport,Beijing,China,PEK,ZBAA,40.0799,116.6031,35,Asia/Shanghai
+18,Shanghai Pudong International Airport,Shanghai,China,PVG,ZSPD,31.1434,121.8052,4,Asia/Shanghai
+19,Seoul Incheon International Airport,Seoul,South Korea,ICN,RKSI,37.4602,126.4407,7,Asia/Seoul
+20,Delhi Indira Gandhi International Airport,Delhi,India,DEL,VIDP,28.5562,77.1,237,Asia/Kolkata
+21,Mumbai Chhatrapati Shivaji Maharaj International Airport,Mumbai,India,BOM,VABB,19.0896,72.8656,11,Asia/Kolkata
+22,Dubai International Airport,Dubai,United Arab Emirates,DXB,OMDB,25.2532,55.3657,19,Asia/Dubai
+23,Doha Hamad International Airport,Doha,Qatar,DOH,OTHH,25.2731,51.6081,4,Asia/Qatar
+24,Abu Dhabi International Airport,Abu Dhabi,United Arab Emirates,AUH,OMAA,24.433,54.6511,27,Asia/Dubai
+25,London Heathrow Airport,London,United Kingdom,LHR,EGLL,51.47,-0.4543,25,Europe/London
+26,Paris Charles de Gaulle Airport,Paris,France,CDG,LFPG,49.0097,2.5479,119,Europe/Paris
+27,Frankfurt Airport,Frankfurt,Germany,FRA,EDDF,50.0379,8.5622,111,Europe/Berlin
+28,Amsterdam Airport Schiphol,Amsterdam,Netherlands,AMS,EHAM,52.3086,4.7639,-3,Europe/Amsterdam
+29,Los Angeles International Airport,Los Angeles,United States,LAX,KLAX,33.9416,-118.4085,38,America/Los_Angeles
+30,San Francisco International Airport,San Francisco,United States,SFO,KSFO,37.6213,-122.379,4,America/Los_Angeles
+31,John F. Kennedy International Airport,New York,United States,JFK,KJFK,40.6413,-73.7781,4,America/New_York
+32,Chicago O'Hare International Airport,Chicago,United States,ORD,KORD,41.9742,-87.9073,204,America/Chicago
+33,Dallas/Fort Worth International Airport,Dallas,United States,DFW,KDFW,32.8998,-97.0403,185,America/Chicago
+34,Vancouver International Airport,Vancouver,Canada,YVR,CYVR,49.1967,-123.1815,4,America/Vancouver
+35,Toronto Pearson International Airport,Toronto,Canada,YYZ,CYYZ,43.6777,-79.6248,173,America/Toronto
+36,Mexico City International Airport,Mexico City,Mexico,MEX,MMMX,19.4363,-99.0721,2230,America/Mexico_City
+37,São Paulo–Guarulhos International Airport,São Paulo,Brazil,GRU,SBGR,-23.4356,-46.4731,750,America/Sao_Paulo
+38,Rio de Janeiro–Galeão International Airport,Rio de Janeiro,Brazil,GIG,SBGL,-22.809,-43.2506,9,America/Sao_Paulo
+39,Johannesburg O. R. Tambo International Airport,Johannesburg,South Africa,JNB,FAOR,-26.1367,28.2411,1694,Africa/Johannesburg
+40,Cape Town International Airport,Cape Town,South Africa,CPT,FACT,-33.9715,18.6021,46,Africa/Johannesburg
+41,Istanbul Airport,Istanbul,Turkey,IST,LTFM,41.2753,28.7519,99,Europe/Istanbul
+42,Rome Fiumicino Airport,Rome,Italy,FCO,LIRF,41.8003,12.2389,5,Europe/Rome
+43,Madrid–Barajas Airport,Madrid,Spain,MAD,LEMD,40.4983,-3.5676,610,Europe/Madrid
+44,Zurich Airport,Zurich,Switzerland,ZRH,LSZH,47.4581,8.5555,432,Europe/Zurich
+45,Vienna International Airport,Vienna,Austria,VIE,LOWW,48.1103,16.5697,183,Europe/Vienna
+46,Honolulu International Airport,Honolulu,United States,HNL,PHNL,21.3187,-157.9225,5,Pacific/Honolulu
