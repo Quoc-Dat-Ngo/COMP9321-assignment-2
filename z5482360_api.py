@@ -1,8 +1,12 @@
+import os
 from enum import StrEnum
 from functools import wraps
 
+
 import bcrypt
-from flask import Flask
+import pandas as pd
+from dotenv import load_dotenv
+from flask import Flask, request
 from flask_jwt_extended import (
     JWTManager,
     create_access_token,
@@ -13,21 +17,25 @@ from flask_jwt_extended import (
 )
 from flask_restx import Api, Resource, abort, fields
 from flask_sqlalchemy import SQLAlchemy
+from loguru import logger
+from sqlalchemy.exc import SQLAlchemyError
+
+load_dotenv()
 
 app = Flask(__name__)
 
 # ---------------------------------
 # Config SQLite database connection
 # ---------------------------------
-app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///app.db"
+app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL", "sqlite:///app.db")
 db = SQLAlchemy(app)
 
 # ------------------------
 # Configure JWT_SECRET_KEY
 # ------------------------
 # Utilise Python built-in 'secrets' library
-app.config["JWT_SECRET_KEY"] = (
-    "282601b3f714615e2b6d371aa9f2db42240dd7a104c26b61ca3ddc497f04a61a"
+app.config["JWT_SECRET_KEY"] = os.getenv(
+    "JWT_SECRET_KEY", "282601b3f714615e2b6d371aa9f2db42240dd7a104c26b61ca3ddc497f04a61a"
 )
 jwt = JWTManager(app)
 
@@ -57,7 +65,9 @@ api = Api(
 
 # Construct namespace
 auth_ns = api.namespace("auth", description="Login")
-users_ns = api.namespace("users", description="User management (for Admin only)")
+admin_ns = api.namespace(
+    "admin", description="User management and importing files (Admin access only)"
+)
 
 
 # ---------------------------------------------
@@ -138,10 +148,10 @@ class User(db.Model):
 class Airline(db.Model):
     __tablename__ = "airlines"
 
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.Text, unique=True, nullable=False)
-    iata = db.Column(db.String(5), unique=True, nullable=False)
-    icao = db.Column(db.String(5), unique=True, nullable=False)
+    airline_id = db.Column(db.Integer, primary_key=True, autoincrement=False)
+    name = db.Column(db.Text, nullable=False)
+    iata_code = db.Column(db.String(5), unique=True, nullable=False)
+    icao_code = db.Column(db.String(5), unique=True, nullable=False)
     country = db.Column(db.Text, nullable=False)
 
 
@@ -149,15 +159,15 @@ class Airline(db.Model):
 class Airport(db.Model):
     __tablename__ = "airports"
 
-    id = db.Column(db.Integer, primary_key=True)
-    name = db.Column(db.Text, unique=True, nullable=False)
+    airport_id = db.Column(db.Integer, primary_key=True, autoincrement=False)
+    name = db.Column(db.Text, nullable=False)
     city = db.Column(db.Text, nullable=False)
     country = db.Column(db.Text, nullable=False)
-    iata = db.Column(db.String(5), unique=True, nullable=False)
-    icao = db.Column(db.String(5), unique=True, nullable=False)
-    lat = db.Column(db.Float, nullable=False)
-    lon = db.Column(db.Float, nullable=False)
-    alt = db.Column(db.Integer, nullable=False)
+    iata_code = db.Column(db.String(5), unique=True, nullable=False)
+    icao_code = db.Column(db.String(5), unique=True, nullable=False)
+    latitude = db.Column(db.Float, nullable=False)
+    longtitude = db.Column(db.Float, nullable=False)
+    altitude = db.Column(db.Integer, nullable=False)
     timezone = db.Column(db.Text, nullable=False)
 
 
@@ -165,22 +175,22 @@ class Airport(db.Model):
 class Route(db.Model):
     __tablename__ = "routes"
 
-    id = db.Column(db.Integer, primary_key=True)
-    airline_id = db.Column(db.Integer, db.ForeignKey("airlines.id"), nullable=False)
-    airline_iata = db.Column(
-        db.String(5), db.ForeignKey("airlines.iata"), nullable=False
+    route_id = db.Column(db.Integer, primary_key=True, autoincrement=False)
+    airline_id = db.Column(
+        db.Integer, db.ForeignKey("airlines.airline_id"), nullable=False
     )
-    src_airport_id = db.Column(db.Integer, db.ForeignKey("airports.id"), nullable=False)
-    src_airport_iata = db.Column(
-        db.String(5), db.ForeignKey("airports.iata"), nullable=False
+    airline_iata = db.Column(db.String(5), nullable=False)
+    origin_airport_id = db.Column(
+        db.Integer, db.ForeignKey("airports.airport_id"), nullable=False
     )
-    des_airport_id = db.Column(db.Integer, db.ForeignKey("airports.id"), nullable=False)
-    des_airport_iata = db.Column(
-        db.String(5), db.ForeignKey("airports.iata"), nullable=False
+    origin_iata = db.Column(db.String(5), nullable=False)
+    destination_airport_id = db.Column(
+        db.Integer, db.ForeignKey("airports.airport_id"), nullable=False
     )
+    destination_iata = db.Column(db.String(5), nullable=False)
     codeshare = db.Column(db.String(5))
     stops = db.Column(db.Integer, nullable=False)
-    equipment = db.Column(db.String(5), nullable=False)
+    equipment = db.Column(db.Text, nullable=False)
 
 
 # Initiate SQLite database on first start-up,
@@ -202,12 +212,12 @@ with app.app_context():
 
         db.session.add_all([admin, user])
         db.session.commit()
-        print("Automatically create 1 admin account and 1 user account.")
+        logger.info("Automatically create 1 admin account and 1 user account.")
 
 # ----------------------------------
 # Model Schema for API documentation
 # ----------------------------------
-user_create_model = users_ns.model(
+user_create_model = admin_ns.model(
     "UserCreate",
     {
         "username": fields.String(
@@ -226,7 +236,7 @@ user_create_model = users_ns.model(
     strict=True,
 )
 
-user_update_activation_model = users_ns.model(
+user_update_activation_model = admin_ns.model(
     "UserActivationUpdate",
     {
         "active": fields.Boolean(
@@ -236,7 +246,7 @@ user_update_activation_model = users_ns.model(
     strict=True,
 )
 
-user_response_model = users_ns.model(
+user_response_model = admin_ns.model(
     "UserResponse",
     {
         "id": fields.Integer(description="Unique identifier of this user"),
@@ -335,31 +345,31 @@ class Login(Resource):
         }, 200
 
 
-# ------------------------
-# CRUD Endpoints for admin
-# ------------------------
-@users_ns.route("")
+# ----------------------------------------------------
+# Requirement Set 1: Admin CRUD/RESTful API endpoints
+# ----------------------------------------------------
+@admin_ns.route("/user")
 class UserList(Resource):
     method_decorators = [require_roles(UserRole.ADMIN)]
 
-    @users_ns.expect(user_create_model, validate=True)
-    @users_ns.doc(
+    @admin_ns.expect(user_create_model, validate=True)
+    @admin_ns.doc(
         description="Add a new User account to the database.\n\n**Access:** Admin only"
     )
-    @users_ns.marshal_with(user_response_model, code=201)
-    @users_ns.response(201, "User created successfully")
-    @users_ns.response(400, "Invalid request payload")
-    @users_ns.response(401, "Unauthorised access, please log in")
-    @users_ns.response(403, "Insufficient permission and/or deactivated account")
-    @users_ns.response(409, "Duplicate username")
+    @admin_ns.marshal_with(user_response_model, code=201)
+    @admin_ns.response(201, "User created successfully")
+    @admin_ns.response(400, "Invalid request payload")
+    @admin_ns.response(401, "Unauthorised access, please log in")
+    @admin_ns.response(403, "Insufficient permission and/or deactivated account")
+    @admin_ns.response(409, "Duplicate username")
     def post(self):
         """Add a new User account"""
-        new_user_data = users_ns.payload
+        new_user_data = admin_ns.payload
 
         request_username = new_user_data.get("username").strip()
         request_password = new_user_data.get("password")
         if len(request_username) < 3 or len(request_password) < 3:
-            users_ns.abort(
+            admin_ns.abort(
                 400, "Username and/or password must be at least 3 characters long"
             )
 
@@ -369,7 +379,7 @@ class UserList(Resource):
             ).scalar_one_or_none()
             is not None
         ):
-            users_ns.abort(
+            admin_ns.abort(
                 409, f"User with username {request_username} already existed"
             )
 
@@ -384,69 +394,69 @@ class UserList(Resource):
         return new_user, 201
 
     # TODO: Add pagination later
-    @users_ns.doc(
+    @admin_ns.doc(
         description="Retrieve a list of accounts alongside with their details.\n\n**Access:** Admin only"
     )
-    @users_ns.marshal_with(user_response_model, as_list=True, code=200)
-    @users_ns.response(200, "List of users")
-    @users_ns.response(401, "Unauthorised access, please log in")
-    @users_ns.response(403, "Insufficient permission and/or deactivated account")
+    @admin_ns.marshal_with(user_response_model, as_list=True, code=200)
+    @admin_ns.response(200, "List of users")
+    @admin_ns.response(401, "Unauthorised access, please log in")
+    @admin_ns.response(403, "Insufficient permission and/or deactivated account")
     def get(self):
         """Retrieve a list of users"""
         get_all_users_statement = db.select(User)
         return db.session.scalars(get_all_users_statement).all(), 200
 
 
-@users_ns.route("/<int:user_id>")
-@users_ns.param("user_id", "The user's unique ID")
+@admin_ns.route("/user/<int:user_id>")
+@admin_ns.param("user_id", "The user's unique ID")
 class UserItem(Resource):
     method_decorators = [require_roles(UserRole.ADMIN)]
 
-    @users_ns.doc(
+    @admin_ns.doc(
         description="Delete a user with specified ID.\n\n**Access:** Admin only"
     )
-    @users_ns.response(204, "Deleted this user")
-    @users_ns.response(401, "Unauthorised access, please log in")
-    @users_ns.response(403, "Insufficient permission to perform this action")
-    @users_ns.response(404, "User account not found")
+    @admin_ns.response(204, "Deleted this user")
+    @admin_ns.response(401, "Unauthorised access, please log in")
+    @admin_ns.response(403, "Insufficient permission to perform this action")
+    @admin_ns.response(404, "User account not found")
     def delete(self, user_id):
         """Delete a specific user"""
         target_user = db.session.get(User, user_id)
         if target_user is None:
-            users_ns.abort(404, "Target user to be deleted not found")
+            admin_ns.abort(404, "Target user to be deleted not found")
 
         if target_user.role == "Admin":
-            users_ns.abort(403, "Cannot delete Admin account")
+            admin_ns.abort(403, "Cannot delete Admin account")
 
         db.session.delete(target_user)
         db.session.commit()
 
         return "", 204
 
-    @users_ns.expect(user_update_activation_model, validate=True)
-    @users_ns.doc(
+    @admin_ns.expect(user_update_activation_model, validate=True)
+    @admin_ns.doc(
         description="Activate/Deactivate a User account with a specified user_id.\n\n**Access:** Admin only"
     )
-    @users_ns.marshal_with(user_response_model, code=200)
-    @users_ns.response(200, "Updated successfully")
-    @users_ns.response(401, "Unauthorised access, please log in")
-    @users_ns.response(403, "Insufficient permission to perform this action")
-    @users_ns.response(404, "User not found")
+    @admin_ns.marshal_with(user_response_model, code=200)
+    @admin_ns.response(200, "Updated successfully")
+    @admin_ns.response(401, "Unauthorised access, please log in")
+    @admin_ns.response(403, "Insufficient permission to perform this action")
+    @admin_ns.response(404, "User not found")
     def patch(self, user_id):
         """Update user activation status"""
-        data = users_ns.payload
+        data = admin_ns.payload
 
         target_status = data.get("active")
 
         target_user = db.session.get(User, user_id)
         if target_user is None:
-            users_ns.abort(404, "Target user to be updated not found")
+            admin_ns.abort(404, "Target user to be updated not found")
 
         if target_user.role == UserRole.ADMIN:
-            users_ns.abort(403, "Cannot take action towards Admin account")
+            admin_ns.abort(403, "Cannot take action towards Admin account")
 
         if target_user.active == target_status:
-            users_ns.abort(400, "Unchanged status, remain as-is")
+            admin_ns.abort(400, "Unchanged status, remain as-is")
 
         target_user.active = target_status
         db.session.add(target_user)
@@ -457,9 +467,312 @@ class UserItem(Resource):
     # TODO: Add get later so that an admin can inspect one account
 
 
-# ------------------------
-# CRUD Endpoints for user
-# ------------------------
+# -------------------------------------------------------------
+# Requirement Set 2: import airports / airlines / routes (CSV)
+# -------------------------------------------------------------
+MODELS = {"airlines": Airline, "airports": Airport, "routes": Route}
+
+SCHEMAS = {
+    "airlines": {
+        "airline_id": ("int", True),
+        "name": ("str", True),
+        "iata_code": ("str", True),
+        "icao_code": ("str", True),
+        "country": ("str", True),
+    },
+    "airports": {
+        "airport_id": ("int", True),
+        "name": ("str", True),
+        "city": ("str", True),
+        "country": ("str", True),
+        "iata_code": ("str", True),
+        "icao_code": ("str", True),
+        "latitude": ("float", True),
+        "longitude": ("float", True),
+        "altitude": ("int", True),
+        "timezone": ("str", True),
+    },
+    "routes": {
+        "route_id": ("int", True),
+        "airline_id": ("int", True),
+        "airline_iata": ("str", True),
+        "origin_airport_id": ("int", True),
+        "origin_iata": ("str", True),
+        "destination_airport_id": ("int", True),
+        "destination_iata": ("str", True),
+        "codeshare": ("str", False),  # can be "Y" or empty
+        "stops": ("int", True),
+        "equipment": ("str", True),
+    },
+}
+
+# Columns that must hold unique values inside one file
+UNIQUE = {
+    "airlines": ["airline_id", "iata_code", "icao_code"],
+    "airports": ["airport_id", "iata_code", "icao_code"],
+    "routes": ["route_id"],
+}
+
+ROUTE_LINKS = [
+    ("airline_id", "airline_iata", "airlines", "airline_id", "iata_code"),
+    ("origin_airport_id", "origin_iata", "airports", "airport_id", "iata_code"),
+    (
+        "destination_airport_id",
+        "destination_iata",
+        "airports",
+        "airport_id",
+        "iata_code",
+    ),
+]
+
+# Reuse last assignment (i.e: assignment 1)
+RANGES = {"latitude": (-90, 90), "longitude": (-180, 180), "stops": (0, 99)}
+
+INT_REGEX = r"[+-]?\d+"
+FLOAT_REGEX = r"[+-]?\d+(\.\d+)?"
+
+
+class ImportValidationError(Exception):
+    """Raised for any problem with an upload; carries the HTTP status to return."""
+
+    def __init__(self, message, status=400):
+        super().__init__(message)
+        self.message = message
+        self.status = status
+
+
+def dataset_name_matcher(field, file):
+    """Work out which dataset a file is: by form-field name first, then by file name."""
+    for candidate in (field, file.filename):
+        file_name = (candidate or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
+        file_name = file_name.removesuffix(".csv")
+
+        if file_name in MODELS:
+            return file_name
+
+        raise ImportValidationError(
+            f"Cannot tell which dataset '{file.filename}' (field '{field}') is. "
+            f"Use form fields / file names: {', '.join(m + '.csv' for m in MODELS)}"
+        )
+
+
+def parse_and_validate_uploaded_file(name, file):
+    """Parse one uploaded CSV into a typed DataFrame, or raise ImportValidationError."""
+    schema = SCHEMAS[name]
+    if not (file.filename or "").lower().endswith(".csv"):
+        raise ImportValidationError(
+            f"{name}: expected a .csv file, got '{file.filename}'"
+        )
+
+    try:
+        df = pd.read_csv(
+            file.stream, dtype=str, keep_default_na=False, encoding="utf-8-sig"
+        )
+    except (pd.errors.EmptyDataError, pd.errors.ParserError, UnicodeDecodeError) as e:
+        raise ImportValidationError(f"{name}.csv is not a readable CSV file: {e}")
+
+    df.columns = df.columns.str.strip()
+    missing_columns = [col for col in schema if col not in df.columns]
+    extra_columns = [col for col in df.columns if col not in schema]
+    if missing_columns or extra_columns:
+        raise ImportValidationError(
+            f"{name}.csv has wrong columns. Missing: {missing_columns}. Unexpected: {extra_columns}. "
+            f"Expected: {list(schema)}"
+        )
+    if df.empty:
+        raise ImportValidationError(f"{name}.csv contains no data rows")
+
+    for col, (type, required) in schema.items():
+        s = df[col].str.strip()
+        blank = s == ""
+        if required and blank.any():
+            raise ImportValidationError(
+                f"{name}.csv: '{col}' is empty at line {blank.idxmax() + 2}"
+            )
+        if type == "int":
+            bad = ~blank & ~s.str.fullmatch(INT_REGEX)
+        elif type == "float":
+            bad = ~blank & ~s.str.fullmatch(FLOAT_REGEX)
+        else:
+            bad = pd.Series(False, index=s.index)
+        if bad.any():
+            raise ImportValidationError(
+                f"{name}.csv: '{col}' must be {type}, found '{s[bad].iloc[0]}' "
+                f"at line {bad.idxmax() + 2}"
+            )
+
+        df[col] = (
+            s.astype(int)
+            if type == "int"
+            else s.astype(float)
+            if type == "float"
+            else s
+        )
+
+        if col in RANGES:
+            lo, hi = RANGES[col]
+            out = ~df[col].between(lo, hi)
+            if out.any():
+                raise ImportValidationError(
+                    f"{name}.csv: '{col}' must be between {lo} and {hi}, "
+                    f"found {df[col][out].iloc[0]} at line {out.idxmax() + 2}"
+                )
+
+    for col in UNIQUE[name]:
+        dup = df[col].duplicated()
+        if dup.any():
+            raise ImportValidationError(
+                f"{name}.csv: duplicate {col} '{df[col][dup].iloc[0]}' "
+                f"at line {dup.idxmax() + 2}"
+            )
+
+    return df
+
+
+def lookup(frames, dataset, id_col, iata_col):
+    """Return as {id: iata} for a dataset: from the upload if it is in this request, otherwise from the DB."""
+    if dataset in frames:
+        return dict(zip(frames[dataset][id_col]), zip(frames[dataset][iata_col]))
+
+    model = MODELS[dataset]
+    rows = db.session.execute(
+        db.select(getattr(model, id_col), getattr(model, iata_col))
+    ).all()
+
+    return {r[0]: r[1] for r in rows}
+
+
+def routes_view(frames):
+    """The routes as they will be after the import: the uploaded ones, othewise the stored ones."""
+    if "routes" in frames:
+        return frames["routes"]
+    cols = ["route_id"] + [c for link in ROUTE_LINKS for c in link[:2]]
+    rows = db.session.execute(db.select(*[getattr(Route, c) for c in cols])).all()
+    return pd.DataFrame([tuple(r) for r in rows], columns=cols)
+
+
+def check_integrity(frames):
+    """Check the combined result of the request (not only just the DB, or just the files)."""
+    routes = routes_view(frames)
+    if routes.empty:
+        return
+
+    for id_col, iata_col, dataset, id_ref, iata_ref in ROUTE_LINKS:
+        ref = lookup(frames, dataset, id_col, iata_col)
+
+        orphan = ~routes[id_col].isin(list(ref))
+        if orphan.any():
+            bad = routes[orphan].iloc[0]
+            raise ImportValidationError(
+                f"{int(orphan.sum())} route(s) would reference a non-existent "
+                f"{dataset[:-1]} (e.g. route_id {bad['route_id']} has {id_col}={bad[id_col]})",
+                409,
+            )
+
+        mismatch = routes[id_col].map(ref) != routes[iata_col]
+        if mismatch.any():
+            bad = routes[mismatch].iloc[0]
+            raise ImportValidationError(
+                f"{int(mismatch.sum())} route(s) have inconsistent {id_col}/{iata_col} "
+                f"(e.g. route_id {bad['route_id']}: {id_col}={bad[id_col]} "
+                f"is not '{bad[iata_col]}')",
+                400 if "routes" in frames else 409,
+            )
+
+
+def replace_data(frames):
+    """Replace the uploaded datasets inside ONE transaction (adhere to atomicity principle as required by the spec)."""
+    try:
+        for name in ("routes", "airports", "airlines"):
+            if name in frames:
+                db.session.execute(db.session.delete(MODELS[name]))
+
+        for name in ("airlines", "airports", "routes"):
+            if name in frames:
+                records = [
+                    {k: (None if v == "" else v) for k, v in rows.item()}
+                    for rows in frames[name].to_dict("records")
+                ]
+                db.session.execute(db.insert(MODELS[name]), records)
+
+        db.session.commit()
+    except Exception:
+        db.session.rollback()
+        raise
+
+
+def check_travel_plans(frames):
+    """Requirement Set 4 hook: decide what happens to plans that use replaced routes.
+
+    TODO: once travel plans exist, compare the plans' route ids with
+    routes_view(frames)["route_id"] and either raise ImportValidationError(..., 409)
+    or mark the affected plans. Document the chosen policy in the upload endpoint.
+    """
+
+
+@admin_ns.route("/upload")
+class FileUpload(Resource):
+    method_decorators = [require_roles(UserRole.ADMIN)]
+
+    @admin_ns.doc(
+        description=(
+            "Import any subset of `airports.csv`, `airlines.csv`, `routes.csv` "
+            "(multipart/form-data; form fields named `airports`, `airlines`, `routes`, "
+            "or any field name as long as the file is called airports.csv / airlines.csv / routes.csv).\n\n"
+            "Each uploaded file **replaces all existing records** of its dataset; datasets not "
+            "in the request are untouched. Every file is validated (columns, types, unique ids, "
+            "id/iata consistency) before anything is written, referential integrity is checked "
+            "on the combined result of the request, and the import is atomic.\n\n"
+            "**Existing travel plans:** TODO - document the chosen policy here.\n\n"
+            "**Access:** Admin only"
+        )
+    )
+    @admin_ns.response(200, "Import successful")
+    @admin_ns.response(
+        400, "No files / malformed file / schema or consistency violation"
+    )
+    @admin_ns.response(401, "Unauthorised access, please log in")
+    @admin_ns.response(403, "Insufficient permission and/or deactivated account")
+    @admin_ns.response(409, "Referential integrity (or travel plan) conflict")
+    def post(self):
+        """Import airports, airlines and/or routes from CSV files"""
+        try:
+            uploads = {}
+
+            for field, file in request.files.items(multi=True):
+                if not file.filename:
+                    continue
+
+                name = dataset_name_matcher(field, file)
+                if name in uploads:
+                    raise ImportValidationError(f"{name} was uploaded more than once")
+
+                uploads[name] = file
+
+            if not uploads:
+                raise ImportValidationError("No files uploaded")
+
+            frames = {
+                name: parse_and_validate_uploaded_file(name, file)
+                for name, file in uploads.items()
+            }
+
+            check_integrity(frames)
+            check_travel_plans(frames)
+        except ImportValidationError as e:
+            admin_ns.abort(e.status, e.message)
+
+        try:
+            replace_data(frames)
+        except SQLAlchemyError:
+            logger.exception("CSV import failed, transaction rolled back")
+            admin_ns.abort(500, "Import failed, no changes were made")
+
+        logger.info("Imported datasets: {}", {n: len(df) for n, df in frames.items()})
+        return {
+            "message": "Import successful",
+            "imported": {name: len(df) for name, df in frames.items()},
+        }, 200
 
 
 # ---------------------
