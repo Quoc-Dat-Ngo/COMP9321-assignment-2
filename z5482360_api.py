@@ -2,27 +2,29 @@ import os
 from enum import StrEnum
 from functools import wraps
 
-
 import bcrypt
 import pandas as pd
 from dotenv import load_dotenv
 from flask import Flask, request
+from flask_cors import CORS
 from flask_jwt_extended import (
     JWTManager,
     create_access_token,
-    create_refresh_token,
     get_jwt,
     get_jwt_identity,
     verify_jwt_in_request,
 )
-from flask_restx import Api, Resource, abort, fields
+from flask_restx import Api, Resource, abort, fields, inputs, reqparse
 from flask_sqlalchemy import SQLAlchemy
 from loguru import logger
 from sqlalchemy.exc import SQLAlchemyError
+from werkzeug.datastructures import FileStorage
 
 load_dotenv()
 
 app = Flask(__name__)
+# Allow browser clients on other origins (e.g. upload_test.html opened from disk)
+CORS(app)
 
 # ---------------------------------
 # Config SQLite database connection
@@ -37,7 +39,29 @@ db = SQLAlchemy(app)
 app.config["JWT_SECRET_KEY"] = os.getenv(
     "JWT_SECRET_KEY", "282601b3f714615e2b6d371aa9f2db42240dd7a104c26b61ca3ddc497f04a61a"
 )
+# Let flask-jwt-extended errors (missing/expired token) reach its own handlers
+# instead of being swallowed by flask-restx as a 500
+app.config["PROPAGATE_EXCEPTIONS"] = True
+# Keep 404 messages as written (no "did you mean ..." suffix from flask-restx)
+app.config["ERROR_404_HELP"] = False
 jwt = JWTManager(app)
+
+
+# Return every token problem as 401 with the same {"message": ...} shape as the rest of the API
+@jwt.unauthorized_loader
+def missing_token_callback(reason):
+    return {"message": f"Unauthorised access, please log in ({reason})"}, 401
+
+
+@jwt.invalid_token_loader
+def invalid_token_callback(reason):
+    return {"message": f"Invalid token ({reason})"}, 401
+
+
+@jwt.expired_token_loader
+def expired_token_callback(jwt_header, jwt_payload):
+    return {"message": "Token has expired, please log in again"}, 401
+
 
 # -----------------------------
 # API and Swagger configuration
@@ -65,11 +89,21 @@ api = Api(
 
 # Construct namespace
 auth_ns = api.namespace("auth", description="Login")
-admin_ns = api.namespace(
-    "admin", description="User management and importing files (Admin access only)"
+user_ns = api.namespace("users", description="User management (Admin access only)")
+dataset_ns = api.namespace(
+    "imports", description="Import CSV files (Admin access only)"
 )
-
-
+airport_ns = api.namespace(
+    "airports", description="Browse and search airports (any active account, read-only)"
+)
+airline_ns = api.namespace(
+    "airlines", description="Browse and search airlines (any active account, read-only)"
+)
+route_ns = api.namespace(
+    "routes",
+    description="Browse and filter routes, e.g. by airline or origin airport "
+    "(any active account, read-only)",
+)
 # ---------------------------------------------
 # Helper functions, custom decorators and enums
 # ---------------------------------------------
@@ -99,7 +133,7 @@ def require_roles(*allowed_roles):
         def wrapper(*args, **kwargs):
             verify_jwt_in_request()
             claims = get_jwt()
-            user = User.retrieve_user_by_username(get_jwt_identity())
+            user = db.session.get(User, int(get_jwt_identity()))
 
             if user is None:
                 abort(401, "Unauthorised access, please log in")
@@ -114,12 +148,34 @@ def require_roles(*allowed_roles):
     return decorator
 
 
+def contains(column, value):
+    """Case-insensitive partial match; % and _ typed by the client are matched literally."""
+    escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return column.ilike(f"%{escaped}%", escape="\\")
+
+
+def paginate(statement, args, key):
+    """Run a select for one page and wrap it in the shared page envelope."""
+    result = db.paginate(
+        statement, page=args["page"], per_page=args["per_page"], error_out=False
+    )
+    return {
+        key: result.items,
+        "page": result.page,
+        "per_page": result.per_page,
+        "total": result.total,
+        "pages": result.pages,
+    }
+
+
 # -----------------------------------------------------------
 # Entity definition/schema for storing in the sqlite database
 # -----------------------------------------------------------
 # User
 class User(db.Model):
     __tablename__ = "users"
+    # Never reuse a deleted user's id, so an old token can't map onto a new account
+    __table_args__ = {"sqlite_autoincrement": True}
 
     # Define each user field/column
     id = db.Column(db.Integer, primary_key=True)
@@ -166,7 +222,7 @@ class Airport(db.Model):
     iata_code = db.Column(db.String(5), unique=True, nullable=False)
     icao_code = db.Column(db.String(5), unique=True, nullable=False)
     latitude = db.Column(db.Float, nullable=False)
-    longtitude = db.Column(db.Float, nullable=False)
+    longitude = db.Column(db.Float, nullable=False)
     altitude = db.Column(db.Integer, nullable=False)
     timezone = db.Column(db.Text, nullable=False)
 
@@ -192,6 +248,14 @@ class Route(db.Model):
     stops = db.Column(db.Integer, nullable=False)
     equipment = db.Column(db.Text, nullable=False)
 
+    # Read-only links to the related rows (imports write the id columns directly)
+    airline = db.relationship("Airline", lazy="joined", viewonly=True)
+    origin = db.relationship(
+        "Airport", foreign_keys=[origin_airport_id], lazy="joined", viewonly=True
+    )
+    destination = db.relationship(
+        "Airport", foreign_keys=[destination_airport_id], lazy="joined", viewonly=True
+    )
 
 # Initiate SQLite database on first start-up,
 # reuse existing database i.e: app.db for subsequent run
@@ -217,7 +281,7 @@ with app.app_context():
 # ----------------------------------
 # Model Schema for API documentation
 # ----------------------------------
-user_create_model = admin_ns.model(
+user_create_model = user_ns.model(
     "UserCreate",
     {
         "username": fields.String(
@@ -236,7 +300,7 @@ user_create_model = admin_ns.model(
     strict=True,
 )
 
-user_update_activation_model = admin_ns.model(
+user_update_activation_model = user_ns.model(
     "UserActivationUpdate",
     {
         "active": fields.Boolean(
@@ -246,7 +310,7 @@ user_update_activation_model = admin_ns.model(
     strict=True,
 )
 
-user_response_model = admin_ns.model(
+user_response_model = user_ns.model(
     "UserResponse",
     {
         "id": fields.Integer(description="Unique identifier of this user"),
@@ -260,6 +324,42 @@ user_response_model = admin_ns.model(
     },
     strict=True,
 )
+
+def page_model(ns, name, key, item_model):
+    """Offset-based pagination shared by every list endpoint."""
+    return ns.model(
+        name,
+        {
+            key: fields.List(
+                fields.Nested(item_model), description=f"The {key} on this page"
+            ),
+            "page": fields.Integer(description="Current page number (starts at 1)"),
+            "per_page": fields.Integer(description="Maximum number of items per page"),
+            "total": fields.Integer(description="Total number of matching items"),
+            "pages": fields.Integer(description="Total number of pages"),
+        },
+    )
+
+
+# Query parameters shared by every list endpoint; copy() it to add filters
+pagination_parser = reqparse.RequestParser()
+pagination_parser.add_argument(
+    "page",
+    type=inputs.positive,
+    default=1,
+    location="args",
+    help="Page number, starting at 1",
+)
+pagination_parser.add_argument(
+    "per_page",
+    type=inputs.int_range(1, 100),
+    default=10,
+    location="args",
+    help="Items per page (1-100)",
+)
+
+user_page_model = page_model(user_ns, "UserPage", "users", user_response_model)
+user_list_parser = pagination_parser.copy()
 
 auth_login_model = auth_ns.model(
     "LogIn",
@@ -287,9 +387,6 @@ auth_login_response_model = auth_ns.model(
         "accessToken": fields.String(
             description="Access token to be place in request header"
         ),
-        "refreshToken": fields.String(
-            description="Refresh token to be used when access token expires"
-        ),
     },
     strict=True,
 )
@@ -302,7 +399,8 @@ auth_login_response_model = auth_ns.model(
 class Login(Resource):
     @auth_ns.expect(auth_login_model, validate=True)
     @auth_ns.doc(
-        description="Entry point for a user to get into app, create access token and refresh token",
+        description="Exchange username and password for a JWT access token. "
+        "Send it as `Authorization: Bearer <token>` on every other request.",
         security=None,
     )
     @auth_ns.marshal_with(auth_login_response_model, code=200)
@@ -325,14 +423,7 @@ class Login(Resource):
             auth_ns.abort(403, "Deactivated account cannot access internal service")
 
         access_token = create_access_token(
-            identity=existing_user.username,
-            additional_claims={
-                "role": existing_user.role,
-            },
-        )
-
-        refresh_token = create_refresh_token(
-            identity=existing_user.username,
+            identity=str(existing_user.id),
             additional_claims={
                 "role": existing_user.role,
             },
@@ -341,35 +432,34 @@ class Login(Resource):
         return {
             "message": "Logged in successfully",
             "accessToken": access_token,
-            "refreshToken": refresh_token,
         }, 200
 
 
 # ----------------------------------------------------
 # Requirement Set 1: Admin CRUD/RESTful API endpoints
 # ----------------------------------------------------
-@admin_ns.route("/user")
+@user_ns.route("")
 class UserList(Resource):
     method_decorators = [require_roles(UserRole.ADMIN)]
 
-    @admin_ns.expect(user_create_model, validate=True)
-    @admin_ns.doc(
+    @user_ns.expect(user_create_model, validate=True)
+    @user_ns.doc(
         description="Add a new User account to the database.\n\n**Access:** Admin only"
     )
-    @admin_ns.marshal_with(user_response_model, code=201)
-    @admin_ns.response(201, "User created successfully")
-    @admin_ns.response(400, "Invalid request payload")
-    @admin_ns.response(401, "Unauthorised access, please log in")
-    @admin_ns.response(403, "Insufficient permission and/or deactivated account")
-    @admin_ns.response(409, "Duplicate username")
+    @user_ns.marshal_with(user_response_model, code=201)
+    @user_ns.response(201, "User created successfully")
+    @user_ns.response(400, "Invalid request payload")
+    @user_ns.response(401, "Unauthorised access, please log in")
+    @user_ns.response(403, "Insufficient permission and/or deactivated account")
+    @user_ns.response(409, "Duplicate username")
     def post(self):
         """Add a new User account"""
-        new_user_data = admin_ns.payload
+        new_user_data = user_ns.payload
 
         request_username = new_user_data.get("username").strip()
         request_password = new_user_data.get("password")
         if len(request_username) < 3 or len(request_password) < 3:
-            admin_ns.abort(
+            user_ns.abort(
                 400, "Username and/or password must be at least 3 characters long"
             )
 
@@ -379,9 +469,7 @@ class UserList(Resource):
             ).scalar_one_or_none()
             is not None
         ):
-            admin_ns.abort(
-                409, f"User with username {request_username} already existed"
-            )
+            user_ns.abort(409, f"User with username {request_username} already existed")
 
         new_user = User(
             username=request_username,
@@ -393,78 +481,93 @@ class UserList(Resource):
 
         return new_user, 201
 
-    # TODO: Add pagination later
-    @admin_ns.doc(
-        description="Retrieve a list of accounts alongside with their details.\n\n**Access:** Admin only"
+    @user_ns.expect(user_list_parser)
+    @user_ns.doc(
+        description="Retrieve a page of accounts alongside with their details, ordered by id. "
+        "Use `page` and `per_page` to navigate; `total` and `pages` tell the client when to stop. "
+        "A page past the end returns an empty `users` list.\n\n**Access:** Admin only"
     )
-    @admin_ns.marshal_with(user_response_model, as_list=True, code=200)
-    @admin_ns.response(200, "List of users")
-    @admin_ns.response(401, "Unauthorised access, please log in")
-    @admin_ns.response(403, "Insufficient permission and/or deactivated account")
+    @user_ns.marshal_with(user_page_model, code=200)
+    @user_ns.response(200, "A page of users")
+    @user_ns.response(400, "Invalid page or per_page")
+    @user_ns.response(401, "Unauthorised access, please log in")
+    @user_ns.response(403, "Insufficient permission and/or deactivated account")
     def get(self):
-        """Retrieve a list of users"""
-        get_all_users_statement = db.select(User)
-        return db.session.scalars(get_all_users_statement).all(), 200
+        """Retrieve a paginated list of users"""
+        args = user_list_parser.parse_args()
+        return paginate(db.select(User).order_by(User.id), args, "users"), 200
 
 
-@admin_ns.route("/user/<int:user_id>")
-@admin_ns.param("user_id", "The user's unique ID")
+@user_ns.route("/<int:user_id>")
+@user_ns.param("user_id", "The user's unique ID")
 class UserItem(Resource):
     method_decorators = [require_roles(UserRole.ADMIN)]
 
-    @admin_ns.doc(
+    @user_ns.doc(
+        description="Retrieve the details of one account.\n\n**Access:** Admin only"
+    )
+    @user_ns.marshal_with(user_response_model, code=200)
+    @user_ns.response(200, "User details")
+    @user_ns.response(401, "Unauthorised access, please log in")
+    @user_ns.response(403, "Insufficient permission and/or deactivated account")
+    @user_ns.response(404, "User not found")
+    def get(self, user_id):
+        """Retrieve a specific user"""
+        target_user = db.session.get(User, user_id)
+        if target_user is None:
+            user_ns.abort(404, f"User {user_id} not found")
+
+        return target_user, 200
+
+    @user_ns.doc(
         description="Delete a user with specified ID.\n\n**Access:** Admin only"
     )
-    @admin_ns.response(204, "Deleted this user")
-    @admin_ns.response(401, "Unauthorised access, please log in")
-    @admin_ns.response(403, "Insufficient permission to perform this action")
-    @admin_ns.response(404, "User account not found")
+    @user_ns.response(204, "Deleted this user")
+    @user_ns.response(401, "Unauthorised access, please log in")
+    @user_ns.response(403, "Insufficient permission to perform this action")
+    @user_ns.response(404, "User account not found")
     def delete(self, user_id):
         """Delete a specific user"""
         target_user = db.session.get(User, user_id)
         if target_user is None:
-            admin_ns.abort(404, "Target user to be deleted not found")
+            user_ns.abort(404, "Target user to be deleted not found")
 
         if target_user.role == "Admin":
-            admin_ns.abort(403, "Cannot delete Admin account")
+            user_ns.abort(403, "Cannot delete Admin account")
 
         db.session.delete(target_user)
         db.session.commit()
 
         return "", 204
 
-    @admin_ns.expect(user_update_activation_model, validate=True)
-    @admin_ns.doc(
+    @user_ns.expect(user_update_activation_model, validate=True)
+    @user_ns.doc(
         description="Activate/Deactivate a User account with a specified user_id.\n\n**Access:** Admin only"
     )
-    @admin_ns.marshal_with(user_response_model, code=200)
-    @admin_ns.response(200, "Updated successfully")
-    @admin_ns.response(401, "Unauthorised access, please log in")
-    @admin_ns.response(403, "Insufficient permission to perform this action")
-    @admin_ns.response(404, "User not found")
+    @user_ns.marshal_with(user_response_model, code=200)
+    @user_ns.response(200, "Updated successfully")
+    @user_ns.response(401, "Unauthorised access, please log in")
+    @user_ns.response(403, "Insufficient permission to perform this action")
+    @user_ns.response(404, "User not found")
     def patch(self, user_id):
         """Update user activation status"""
-        data = admin_ns.payload
+        data = user_ns.payload
 
         target_status = data.get("active")
 
         target_user = db.session.get(User, user_id)
         if target_user is None:
-            admin_ns.abort(404, "Target user to be updated not found")
+            user_ns.abort(404, "Target user to be updated not found")
 
         if target_user.role == UserRole.ADMIN:
-            admin_ns.abort(403, "Cannot take action towards Admin account")
+            user_ns.abort(403, "Cannot take action towards Admin account")
 
-        if target_user.active == target_status:
-            admin_ns.abort(400, "Unchanged status, remain as-is")
-
+        # Setting the status it already has so that PATCH adheres idempotentency
         target_user.active = target_status
         db.session.add(target_user)
         db.session.commit()
 
         return target_user, 200
-
-    # TODO: Add get later so that an admin can inspect one account
 
 
 # -------------------------------------------------------------
@@ -531,6 +634,39 @@ RANGES = {"latitude": (-90, 90), "longitude": (-180, 180), "stops": (0, 99)}
 INT_REGEX = r"[+-]?\d+"
 FLOAT_REGEX = r"[+-]?\d+(\.\d+)?"
 
+# Request parser for POST /upload
+upload_parser = reqparse.RequestParser()
+for _name in MODELS:
+    upload_parser.add_argument(
+        _name,
+        location="files",
+        type=FileStorage,
+        required=False,
+        help=f"Optional. The file must be named exactly {_name}.csv",
+    )
+
+imported_counts_model = dataset_ns.model(
+    "ImportedCounts",
+    {
+        name: fields.Integer(
+            description=f"Number of {name} now stored (omitted if {name}.csv was not uploaded)"
+        )
+        for name in MODELS
+    },
+)
+
+import_response_model = dataset_ns.model(
+    "ImportResponse",
+    {
+        "message": fields.String(description="Outcome of the import"),
+        "imported": fields.Nested(
+            imported_counts_model,
+            skip_none=True,
+            description="Record count per dataset replaced by this request",
+        ),
+    },
+)
+
 
 class ImportValidationError(Exception):
     """Raised for any problem with an upload; carries the HTTP status to return."""
@@ -541,19 +677,18 @@ class ImportValidationError(Exception):
         self.status = status
 
 
-def dataset_name_matcher(field, file):
-    """Work out which dataset a file is: by form-field name first, then by file name."""
-    for candidate in (field, file.filename):
-        file_name = (candidate or "").replace("\\", "/").rsplit("/", 1)[-1].lower()
-        file_name = file_name.removesuffix(".csv")
+def dataset_name_matcher(file):
+    """Work out which dataset an upload is from its file name only."""
+    file_name = (file.filename or "").replace("\\", "/").rsplit("/", 1)[-1]
 
-        if file_name in MODELS:
-            return file_name
+    for dataset in MODELS:
+        if file_name == f"{dataset}.csv":
+            return dataset
 
-        raise ImportValidationError(
-            f"Cannot tell which dataset '{file.filename}' (field '{field}') is. "
-            f"Use form fields / file names: {', '.join(m + '.csv' for m in MODELS)}"
-        )
+    raise ImportValidationError(
+        f"Unexpected file name '{file.filename}'. "
+        f"Upload files named exactly: {', '.join(m + '.csv' for m in MODELS)}"
+    )
 
 
 def parse_and_validate_uploaded_file(name, file):
@@ -572,6 +707,8 @@ def parse_and_validate_uploaded_file(name, file):
         raise ImportValidationError(f"{name}.csv is not a readable CSV file: {e}")
 
     df.columns = df.columns.str.strip()
+    # Short rows come back as NaN even with keep_default_na=False
+    df = df.fillna("")
     missing_columns = [col for col in schema if col not in df.columns]
     extra_columns = [col for col in df.columns if col not in schema]
     if missing_columns or extra_columns:
@@ -632,7 +769,7 @@ def parse_and_validate_uploaded_file(name, file):
 def lookup(frames, dataset, id_col, iata_col):
     """Return as {id: iata} for a dataset: from the upload if it is in this request, otherwise from the DB."""
     if dataset in frames:
-        return dict(zip(frames[dataset][id_col]), zip(frames[dataset][iata_col]))
+        return dict(zip(frames[dataset][id_col], frames[dataset][iata_col]))
 
     model = MODELS[dataset]
     rows = db.session.execute(
@@ -658,7 +795,7 @@ def check_integrity(frames):
         return
 
     for id_col, iata_col, dataset, id_ref, iata_ref in ROUTE_LINKS:
-        ref = lookup(frames, dataset, id_col, iata_col)
+        ref = lookup(frames, dataset, id_ref, iata_ref)
 
         orphan = ~routes[id_col].isin(list(ref))
         if orphan.any():
@@ -685,13 +822,13 @@ def replace_data(frames):
     try:
         for name in ("routes", "airports", "airlines"):
             if name in frames:
-                db.session.execute(db.session.delete(MODELS[name]))
+                db.session.execute(db.delete(MODELS[name]))
 
         for name in ("airlines", "airports", "routes"):
             if name in frames:
                 records = [
-                    {k: (None if v == "" else v) for k, v in rows.item()}
-                    for rows in frames[name].to_dict("records")
+                    {k: (None if v == "" else v) for k, v in row.items()}
+                    for row in frames[name].to_dict("records")
                 ]
                 db.session.execute(db.insert(MODELS[name]), records)
 
@@ -702,48 +839,55 @@ def replace_data(frames):
 
 
 def check_travel_plans(frames):
-    """Requirement Set 4 hook: decide what happens to plans that use replaced routes.
+    """Requirement Set 4 hook. Policy: reject (409) a routes import that would remove
+    any route_id still used by a travel plan; routes are matched by route_id only.
 
-    TODO: once travel plans exist, compare the plans' route ids with
-    routes_view(frames)["route_id"] and either raise ImportValidationError(..., 409)
-    or mark the affected plans. Document the chosen policy in the upload endpoint.
+    TODO: once travel plans exist, compare the route ids used by plans with
+    frames["routes"]["route_id"] and raise ImportValidationError(..., 409) listing the missing ids.
     """
 
 
-@admin_ns.route("/upload")
+@dataset_ns.route("")
 class FileUpload(Resource):
     method_decorators = [require_roles(UserRole.ADMIN)]
 
-    @admin_ns.doc(
+    @dataset_ns.expect(upload_parser)
+    @dataset_ns.doc(
         description=(
             "Import any subset of `airports.csv`, `airlines.csv`, `routes.csv` "
-            "(multipart/form-data; form fields named `airports`, `airlines`, `routes`, "
-            "or any field name as long as the file is called airports.csv / airlines.csv / routes.csv).\n\n"
+            "(multipart/form-data; any field name as long as the file is called exactly airports.csv / airlines.csv / routes.csv).\n\n"
             "Each uploaded file **replaces all existing records** of its dataset; datasets not "
             "in the request are untouched. Every file is validated (columns, types, unique ids, "
             "id/iata consistency) before anything is written, referential integrity is checked "
             "on the combined result of the request, and the import is atomic.\n\n"
-            "**Existing travel plans:** TODO - document the chosen policy here.\n\n"
+            "**Existing travel plans:** an import that includes `routes.csv` is **rejected with 409** "
+            "if any travel plan (of any account) references a `route_id` that is not in the new file; "
+            "the response lists the missing route ids and nothing is changed. Routes are matched by "
+            "`route_id` only, so a route that keeps its id but changes details stays in the plans. "
+            "Because plans are private, the admin cannot edit other users' plans: the owners must "
+            "remove those routes first. Imports of only `airports.csv` / `airlines.csv` cannot remove "
+            "routes, so they are never blocked by travel plans.\n\n"
             "**Access:** Admin only"
         )
     )
-    @admin_ns.response(200, "Import successful")
-    @admin_ns.response(
+    @dataset_ns.marshal_with(import_response_model, code=200, skip_none=True)
+    @dataset_ns.response(200, "Import successful")
+    @dataset_ns.response(
         400, "No files / malformed file / schema or consistency violation"
     )
-    @admin_ns.response(401, "Unauthorised access, please log in")
-    @admin_ns.response(403, "Insufficient permission and/or deactivated account")
-    @admin_ns.response(409, "Referential integrity (or travel plan) conflict")
+    @dataset_ns.response(401, "Unauthorised access, please log in")
+    @dataset_ns.response(403, "Insufficient permission and/or deactivated account")
+    @dataset_ns.response(409, "Referential integrity (or travel plan) conflict")
     def post(self):
         """Import airports, airlines and/or routes from CSV files"""
         try:
             uploads = {}
 
-            for field, file in request.files.items(multi=True):
+            for _field, file in request.files.items(multi=True):
                 if not file.filename:
                     continue
 
-                name = dataset_name_matcher(field, file)
+                name = dataset_name_matcher(file)
                 if name in uploads:
                     raise ImportValidationError(f"{name} was uploaded more than once")
 
@@ -760,19 +904,454 @@ class FileUpload(Resource):
             check_integrity(frames)
             check_travel_plans(frames)
         except ImportValidationError as e:
-            admin_ns.abort(e.status, e.message)
+            dataset_ns.abort(e.status, e.message)
 
         try:
             replace_data(frames)
         except SQLAlchemyError:
             logger.exception("CSV import failed, transaction rolled back")
-            admin_ns.abort(500, "Import failed, no changes were made")
+            dataset_ns.abort(500, "Import failed, no changes were made")
 
         logger.info("Imported datasets: {}", {n: len(df) for n, df in frames.items()})
         return {
             "message": "Import successful",
             "imported": {name: len(df) for name, df in frames.items()},
         }, 200
+
+# --------------------------------------------------------------------------------
+# Requirement Set 3: Access data/info about imported Airports, Airlines and Routes
+# --------------------------------------------------------------------------------
+READ_ACCESS = (
+    "\n\n**Access:** any active account (Admin or User). "
+    "Data is empty until the Admin imports it via `POST /imports`."
+)
+MATCHING_NOTE = (
+    "\n\n**Matching:** text filters (name, city, country) are case-insensitive partial matches "
+    "(`aus` matches *Australia*); code filters are case-insensitive exact matches. Filters "
+    "combine with AND. Fuzzy matching is not used: codes are identifiers where a near miss "
+    "is a different airport/airline, and partial matching already covers incomplete names."
+)
+
+# ---- Response models ----
+# Small summaries embedded in routes so a client sees names without extra calls,
+# plus an href to follow for the full record
+airport_summary_model = airport_ns.model(
+    "AirportSummary",
+    {
+        "airport_id": fields.Integer(description="Airport id"),
+        "iata_code": fields.String(description="3-letter IATA code, e.g. SYD"),
+        "name": fields.String(description="Airport name"),
+        "city": fields.String(description="City served"),
+        "country": fields.String(description="Country"),
+        "href": fields.String(
+            attribute=lambda a: api.url_for(AirportItem, airport_id=a.airport_id),
+            description="URL of the full airport record",
+        ),
+    },
+)
+
+airline_summary_model = airline_ns.model(
+    "AirlineSummary",
+    {
+        "airline_id": fields.Integer(description="Airline id"),
+        "iata_code": fields.String(description="2-letter IATA code, e.g. QF"),
+        "name": fields.String(description="Airline name"),
+        "href": fields.String(
+            attribute=lambda a: api.url_for(AirlineItem, airline_id=a.airline_id),
+            description="URL of the full airline record",
+        ),
+    },
+)
+
+airport_links_model = airport_ns.model(
+    "AirportLinks",
+    {
+        "self": fields.String(
+            attribute=lambda a: api.url_for(AirportItem, airport_id=a.airport_id)
+        ),
+        "airlines": fields.String(
+            attribute=lambda a: api.url_for(AirportAirlines, airport_id=a.airport_id),
+            description="Airlines operating from this airport",
+        ),
+        "departing_routes": fields.String(
+            attribute=lambda a: api.url_for(RouteList, origin=a.iata_code),
+            description="Routes departing from this airport",
+        ),
+        "arriving_routes": fields.String(
+            attribute=lambda a: api.url_for(RouteList, destination=a.iata_code),
+            description="Routes arriving at this airport",
+        ),
+    },
+)
+
+airport_model = airport_ns.model(
+    "Airport",
+    {
+        "airport_id": fields.Integer(description="Airport id"),
+        "name": fields.String(description="Airport name"),
+        "city": fields.String(description="City served"),
+        "country": fields.String(description="Country"),
+        "iata_code": fields.String(description="3-letter IATA code"),
+        "icao_code": fields.String(description="4-letter ICAO code"),
+        "latitude": fields.Float(description="Latitude in degrees"),
+        "longitude": fields.Float(description="Longitude in degrees"),
+        "altitude": fields.Integer(description="Altitude in feet"),
+        "timezone": fields.String(description="IANA timezone, e.g. Australia/Sydney"),
+        "_links": fields.Nested(
+            airport_links_model,
+            attribute=lambda a: a,
+            description="Related resources",
+        ),
+    },
+)
+
+airline_links_model = airline_ns.model(
+    "AirlineLinks",
+    {
+        "self": fields.String(
+            attribute=lambda a: api.url_for(AirlineItem, airline_id=a.airline_id)
+        ),
+        "routes": fields.String(
+            attribute=lambda a: api.url_for(RouteList, airline=a.iata_code),
+            description="Routes operated by this airline",
+        ),
+    },
+)
+
+airline_model = airline_ns.model(
+    "Airline",
+    {
+        "airline_id": fields.Integer(description="Airline id"),
+        "name": fields.String(description="Airline name"),
+        "iata_code": fields.String(description="2-letter IATA code"),
+        "icao_code": fields.String(description="3-letter ICAO code"),
+        "country": fields.String(description="Country of the airline"),
+        "_links": fields.Nested(
+            airline_links_model,
+            attribute=lambda a: a,
+            description="Related resources",
+        ),
+    },
+)
+
+route_links_model = route_ns.model(
+    "RouteLinks",
+    {
+        "self": fields.String(
+            attribute=lambda r: api.url_for(RouteItem, route_id=r.route_id)
+        ),
+    },
+)
+
+route_model = route_ns.model(
+    "Route",
+    {
+        "route_id": fields.Integer(description="Route id"),
+        "airline": fields.Nested(
+            airline_summary_model, description="Airline operating the route"
+        ),
+        "origin": fields.Nested(airport_summary_model, description="Departure airport"),
+        "destination": fields.Nested(
+            airport_summary_model, description="Arrival airport"
+        ),
+        "codeshare": fields.Boolean(
+            attribute=lambda r: r.codeshare == "Y",
+            description="True if the flight is a codeshare operated by another carrier",
+        ),
+        "stops": fields.Integer(description="Number of stops (0 = direct)"),
+        "equipment": fields.String(description="Aircraft type code, e.g. A320, 789"),
+        "_links": fields.Nested(
+            route_links_model, attribute=lambda r: r, description="Related resources"
+        ),
+    },
+)
+
+airport_page_model = page_model(airport_ns, "AirportPage", "airports", airport_model)
+airline_page_model = page_model(airline_ns, "AirlinePage", "airlines", airline_model)
+route_page_model = page_model(route_ns, "RoutePage", "routes", route_model)
+
+# ---- Query parameters ----
+airport_list_parser = pagination_parser.copy()
+airport_list_parser.add_argument(
+    "name", location="args", help="Partial airport name, e.g. kingsford"
+)
+airport_list_parser.add_argument("city", location="args", help="Partial city, e.g. syd")
+airport_list_parser.add_argument(
+    "country", location="args", help="Partial country, e.g. aus"
+)
+airport_list_parser.add_argument(
+    "code", location="args", help="Exact IATA or ICAO code, e.g. SYD or YSSY"
+)
+
+airline_list_parser = pagination_parser.copy()
+airline_list_parser.add_argument(
+    "name", location="args", help="Partial airline name, e.g. qan"
+)
+airline_list_parser.add_argument(
+    "country", location="args", help="Partial country, e.g. aus"
+)
+airline_list_parser.add_argument(
+    "code", location="args", help="Exact IATA or ICAO code, e.g. QF or QFA"
+)
+
+route_list_parser = pagination_parser.copy()
+route_list_parser.add_argument(
+    "airline", location="args", help="Exact airline IATA code, e.g. QF"
+)
+route_list_parser.add_argument(
+    "origin", location="args", help="Exact origin airport IATA code, e.g. SYD"
+)
+route_list_parser.add_argument(
+    "destination", location="args", help="Exact destination airport IATA code, e.g. MEL"
+)
+route_list_parser.add_argument(
+    "origin_country", location="args", help="Partial origin country, e.g. aus"
+)
+route_list_parser.add_argument(
+    "destination_country", location="args", help="Partial destination country, e.g. jap"
+)
+route_list_parser.add_argument(
+    "direct",
+    type=inputs.boolean,
+    location="args",
+    help="true = non-stop routes only, false = routes with stops only",
+)
+route_list_parser.add_argument(
+    "codeshare", type=inputs.boolean, location="args", help="true / false"
+)
+route_list_parser.add_argument(
+    "equipment", location="args", help="Exact aircraft type code, e.g. A320"
+)
+
+
+# ---- Airport-related information ----
+@airport_ns.route("")
+class AirportList(Resource):
+    method_decorators = [require_roles(UserRole.ADMIN, UserRole.USER)]
+
+    @airport_ns.expect(airport_list_parser)
+    @airport_ns.doc(
+        description="Retrieve a page of airports ordered by id, optionally filtered."
+        + MATCHING_NOTE
+        + READ_ACCESS
+    )
+    @airport_ns.marshal_with(airport_page_model, code=200)
+    @airport_ns.response(200, "A page of airports")
+    @airport_ns.response(400, "Invalid query parameter")
+    @airport_ns.response(401, "Unauthorised access, please log in")
+    @airport_ns.response(403, "Deactivated account")
+    def get(self):
+        """Retrieve a paginated list of airports"""
+        args = airport_list_parser.parse_args()
+        statement = db.select(Airport).order_by(Airport.airport_id)
+
+        for col in ("name", "city", "country"):
+            if args[col]:
+                statement = statement.where(contains(getattr(Airport, col), args[col]))
+        if args["code"]:
+            code = args["code"].strip().upper()
+            statement = statement.where(
+                db.or_(Airport.iata_code == code, Airport.icao_code == code)
+            )
+
+        return paginate(statement, args, "airports"), 200
+
+
+@airport_ns.route("/<int:airport_id>")
+@airport_ns.param("airport_id", "The airport's unique ID")
+class AirportItem(Resource):
+    method_decorators = [require_roles(UserRole.ADMIN, UserRole.USER)]
+
+    @airport_ns.doc(
+        description="Retrieve one airport. `_links` points to the airlines operating from it "
+        "and to its departing / arriving routes." + READ_ACCESS
+    )
+    @airport_ns.marshal_with(airport_model, code=200)
+    @airport_ns.response(200, "Airport details")
+    @airport_ns.response(401, "Unauthorised access, please log in")
+    @airport_ns.response(403, "Deactivated account")
+    @airport_ns.response(404, "Airport not found")
+    def get(self, airport_id):
+        """Retrieve a specific airport"""
+        airport = db.session.get(Airport, airport_id)
+        if airport is None:
+            airport_ns.abort(404, f"Airport {airport_id} not found")
+
+        return airport, 200
+
+
+@airport_ns.route("/<int:airport_id>/airlines")
+@airport_ns.param("airport_id", "The airport's unique ID")
+class AirportAirlines(Resource):
+    method_decorators = [require_roles(UserRole.ADMIN, UserRole.USER)]
+
+    @airport_ns.expect(pagination_parser)
+    @airport_ns.doc(
+        description="Retrieve the airlines operating from this airport, i.e. airlines with at "
+        "least one route **departing** from it, ordered by id." + READ_ACCESS
+    )
+    @airport_ns.marshal_with(airline_page_model, code=200)
+    @airport_ns.response(200, "A page of airlines")
+    @airport_ns.response(400, "Invalid query parameter")
+    @airport_ns.response(401, "Unauthorised access, please log in")
+    @airport_ns.response(403, "Deactivated account")
+    @airport_ns.response(404, "Airport not found")
+    def get(self, airport_id):
+        """Retrieve the airlines operating from an airport"""
+        args = pagination_parser.parse_args()
+        if db.session.get(Airport, airport_id) is None:
+            airport_ns.abort(404, f"Airport {airport_id} not found")
+
+        departing_airlines = db.select(Route.airline_id).where(
+            Route.origin_airport_id == airport_id
+        )
+        statement = (
+            db.select(Airline)
+            .where(Airline.airline_id.in_(departing_airlines))
+            .order_by(Airline.airline_id)
+        )
+        return paginate(statement, args, "airlines"), 200
+
+
+# ---- Airline-related information ----
+@airline_ns.route("")
+class AirlineList(Resource):
+    method_decorators = [require_roles(UserRole.ADMIN, UserRole.USER)]
+
+    @airline_ns.expect(airline_list_parser)
+    @airline_ns.doc(
+        description="Retrieve a page of airlines ordered by id, optionally filtered."
+        + MATCHING_NOTE
+        + READ_ACCESS
+    )
+    @airline_ns.marshal_with(airline_page_model, code=200)
+    @airline_ns.response(200, "A page of airlines")
+    @airline_ns.response(400, "Invalid query parameter")
+    @airline_ns.response(401, "Unauthorised access, please log in")
+    @airline_ns.response(403, "Deactivated account")
+    def get(self):
+        """Retrieve a paginated list of airlines"""
+        args = airline_list_parser.parse_args()
+        statement = db.select(Airline).order_by(Airline.airline_id)
+
+        for col in ("name", "country"):
+            if args[col]:
+                statement = statement.where(contains(getattr(Airline, col), args[col]))
+        if args["code"]:
+            code = args["code"].strip().upper()
+            statement = statement.where(
+                db.or_(Airline.iata_code == code, Airline.icao_code == code)
+            )
+
+        return paginate(statement, args, "airlines"), 200
+
+
+@airline_ns.route("/<int:airline_id>")
+@airline_ns.param("airline_id", "The airline's unique ID")
+class AirlineItem(Resource):
+    method_decorators = [require_roles(UserRole.ADMIN, UserRole.USER)]
+
+    @airline_ns.doc(
+        description="Retrieve one airline. `_links.routes` lists the routes it operates."
+        + READ_ACCESS
+    )
+    @airline_ns.marshal_with(airline_model, code=200)
+    @airline_ns.response(200, "Airline details")
+    @airline_ns.response(401, "Unauthorised access, please log in")
+    @airline_ns.response(403, "Deactivated account")
+    @airline_ns.response(404, "Airline not found")
+    def get(self, airline_id):
+        """Retrieve a specific airline"""
+        airline = db.session.get(Airline, airline_id)
+        if airline is None:
+            airline_ns.abort(404, f"Airline {airline_id} not found")
+
+        return airline, 200
+
+
+# ---- Route-related information ----
+@route_ns.route("")
+class RouteList(Resource):
+    method_decorators = [require_roles(UserRole.ADMIN, UserRole.USER)]
+
+    @route_ns.expect(route_list_parser)
+    @route_ns.doc(
+        description="Retrieve a page of routes ordered by id, optionally filtered. "
+        "Each route embeds a summary of its airline and airports with an `href` to the full record.\n\n"
+        "Common lookups:\n"
+        "- routes of an airline: `?airline=QF`\n"
+        "- routes departing an airport: `?origin=SYD`\n"
+        "- direct flights between two airports: `?origin=SYD&destination=MEL&direct=true`\n"
+        "- international routes from a country: `?origin_country=aus&destination_country=jap`\n\n"
+        "These are filters on one collection rather than separate sub-endpoints, so they can be "
+        "combined freely; airport and airline records link here via `_links`."
+        + MATCHING_NOTE
+        + READ_ACCESS
+    )
+    @route_ns.marshal_with(route_page_model, code=200)
+    @route_ns.response(200, "A page of routes")
+    @route_ns.response(400, "Invalid query parameter")
+    @route_ns.response(401, "Unauthorised access, please log in")
+    @route_ns.response(403, "Deactivated account")
+    def get(self):
+        """Retrieve a paginated list of routes"""
+        args = route_list_parser.parse_args()
+        statement = db.select(Route).order_by(Route.route_id)
+
+        for arg, col in (
+            ("airline", Route.airline_iata),
+            ("origin", Route.origin_iata),
+            ("destination", Route.destination_iata),
+        ):
+            if args[arg]:
+                statement = statement.where(col == args[arg].strip().upper())
+        if args["origin_country"]:
+            statement = statement.where(
+                Route.origin.has(contains(Airport.country, args["origin_country"]))
+            )
+        if args["destination_country"]:
+            statement = statement.where(
+                Route.destination.has(
+                    contains(Airport.country, args["destination_country"])
+                )
+            )
+        if args["direct"] is not None:
+            statement = statement.where(
+                Route.stops == 0 if args["direct"] else Route.stops > 0
+            )
+        if args["codeshare"] is not None:
+            statement = statement.where(
+                Route.codeshare == "Y" if args["codeshare"] else Route.codeshare.is_(None)
+            )
+        if args["equipment"]:
+            statement = statement.where(
+                db.func.upper(Route.equipment) == args["equipment"].strip().upper()
+            )
+
+        return paginate(statement, args, "routes"), 200
+
+
+@route_ns.route("/<int:route_id>")
+@route_ns.param("route_id", "The route's unique ID")
+class RouteItem(Resource):
+    method_decorators = [require_roles(UserRole.ADMIN, UserRole.USER)]
+
+    @route_ns.doc(
+        description="Retrieve one route with summaries of its airline, origin and destination; "
+        "follow each `href` for the full record." + READ_ACCESS
+    )
+    @route_ns.marshal_with(route_model, code=200)
+    @route_ns.response(200, "Route details")
+    @route_ns.response(401, "Unauthorised access, please log in")
+    @route_ns.response(403, "Deactivated account")
+    @route_ns.response(404, "Route not found")
+    def get(self, route_id):
+        """Retrieve a specific route"""
+        route = db.session.get(Route, route_id)
+        if route is None:
+            route_ns.abort(404, f"Route {route_id} not found")
+
+        return route, 200
 
 
 # ---------------------
