@@ -1,11 +1,40 @@
+"""
+Flight Travel Planner API (COMP9321 Assignment 2, due: 6pm - 29/10/2026)
+
+The following file includes several sections such as:
+  * configuration, Swagger setup and namespaces
+  * helpers shared by every endpoint (custom auth decorator, matching, pagination)
+  * SQLAlchemy models + first-run seeding of the `admin` and `user` accounts (as required by the spec)
+  * Requirement Set 1 /auth, /users                 - JWT login, account management (admin only)
+  * Requirement Set 2 /imports                      - validated, atomic CSV import (admin only)
+  * Requirement Set 3 /airports, /airlines, /routes - read-only browsing with filters and links
+  * Requirement Set 4 /travel-plans                 - private plans and their routes (owner only)
+  * Requirement Set 5 /export                       - JSON file / PNG timeline of the caller's plans
+
+Key design decisions:
+  * Authentication is a stateless JWT access token (`Authorization: Bearer <token>`). The token
+    only says *who* the caller is; whether the account still exists and is active is re-checked
+    in the database on every request, so deactivating or deleting an account takes effect
+    immediately even for tokens issued earlier.
+  * Every error is JSON of the form {"message": ...} (plus "errors" for payload validation).
+  * Private resources (travel plans) that belong to someone else answer 404, never 403, so a
+    client cannot discover which ids exist.
+  * Every list endpoint uses the same offset pagination (`page`, `per_page`) and envelope.
+"""
+
+import io
+import json
 import os
+from collections import Counter
+from datetime import UTC, date, datetime
 from enum import StrEnum
 from functools import wraps
 
 import bcrypt
+import matplotlib.dates as mdates
 import pandas as pd
 from dotenv import load_dotenv
-from flask import Flask, request
+from flask import Flask, Response, g, request
 from flask_cors import CORS
 from flask_jwt_extended import (
     JWTManager,
@@ -14,9 +43,10 @@ from flask_jwt_extended import (
     get_jwt_identity,
     verify_jwt_in_request,
 )
-from flask_restx import Api, Resource, abort, fields, inputs, reqparse
+from flask_restx import Api, Resource, abort, fields, inputs, marshal, reqparse
 from flask_sqlalchemy import SQLAlchemy
 from loguru import logger
+from matplotlib.figure import Figure
 from sqlalchemy.exc import SQLAlchemyError
 from werkzeug.datastructures import FileStorage
 
@@ -29,13 +59,19 @@ CORS(app)
 # ---------------------------------
 # Config SQLite database connection
 # ---------------------------------
+# A relative SQLite path: Flask-SQLAlchemy resolves it inside ./instance/ (instance/app.db).
+# The file is created on first run and reused afterwards, so data survives restarts.
+# DATABASE_URL lets the tests run against a separate throw-away database, e.g.
+#   DATABASE_URL=sqlite:///test.db python z5482360_api.py
 app.config["SQLALCHEMY_DATABASE_URI"] = os.getenv("DATABASE_URL", "sqlite:///app.db")
 db = SQLAlchemy(app)
 
 # ------------------------
 # Configure JWT_SECRET_KEY
 # ------------------------
-# Utilise Python built-in 'secrets' library
+# Generated once with Python's built-in `secrets` library. Read from the environment (.env) when
+# set; the fallback keeps the assignment runnable without any setup. Access tokens use
+# flask-jwt-extended's default lifetime of 15 minutes, after which the client logs in again.
 app.config["JWT_SECRET_KEY"] = os.getenv(
     "JWT_SECRET_KEY", "282601b3f714615e2b6d371aa9f2db42240dd7a104c26b61ca3ddc497f04a61a"
 )
@@ -44,6 +80,9 @@ app.config["JWT_SECRET_KEY"] = os.getenv(
 app.config["PROPAGATE_EXCEPTIONS"] = True
 # Keep 404 messages as written (no "did you mean ..." suffix from flask-restx)
 app.config["ERROR_404_HELP"] = False
+# Tolerate a few seconds of clock jitter: a token used immediately after login was otherwise
+# rejected as "not yet valid (iat)" when the system clock stepped backwards (seen on WSL)
+app.config["JWT_DECODE_LEEWAY"] = 5
 jwt = JWTManager(app)
 
 
@@ -104,6 +143,16 @@ route_ns = api.namespace(
     description="Browse and filter routes, e.g. by airline or origin airport "
     "(any active account, read-only)",
 )
+plan_ns = api.namespace(
+    "travel-plans",
+    description="Create and manage your own private travel plans (any active account)",
+)
+export_ns = api.namespace(
+    "export",
+    description="Export your own travel plans as a JSON file or a timeline image (any active account)",
+)
+
+
 # ---------------------------------------------
 # Helper functions, custom decorators and enums
 # ---------------------------------------------
@@ -126,7 +175,14 @@ class UserRole(StrEnum):
     USER = "User"
 
 
-# Custom decorator to check the permission (i.e: Role) and the activation status of request user
+# Custom decorator to check the permission (i.e: Role) and the activation status of request user.
+# Order of checks matters for the status codes:
+#   no/invalid/expired token -> 401 (handled by flask-jwt-extended's loaders above)
+#   token of a deleted account -> 401 (the token is valid but no longer identifies anyone)
+#   deactivated account       -> 403 (known caller, but not allowed in)
+#   wrong role                -> 403
+# The role is read from the token claim: roles never change after an account is created, so the
+# claim cannot go stale. Activation *can* change, so it is always read from the database.
 def require_roles(*allowed_roles):
     def decorator(fn):
         @wraps(fn)
@@ -141,6 +197,8 @@ def require_roles(*allowed_roles):
                 abort(403, "This account has been deactivated")
             if claims.get("role") not in allowed_roles:
                 abort(403, "Insufficient permission to perform this action")
+            # Remember the caller so endpoints can check ownership (e.g. travel plans)
+            g.current_user = user
             return fn(*args, **kwargs)
 
         return wrapper
@@ -149,13 +207,21 @@ def require_roles(*allowed_roles):
 
 
 def contains(column, value):
-    """Case-insensitive partial match; % and _ typed by the client are matched literally."""
+    """Case-insensitive partial match; % and _ typed by the client are matched literally.
+
+    Without escaping, a client searching for "%" would match every row, because % and _ are
+    LIKE wildcards. The backslash is escaped first so it can serve as the escape character.
+    """
     escaped = value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return column.ilike(f"%{escaped}%", escape="\\")
 
 
 def paginate(statement, args, key):
-    """Run a select for one page and wrap it in the shared page envelope."""
+    """Run a select for one page and wrap it in the shared page envelope.
+
+    error_out=False: a page past the end returns an empty list instead of a 404, because the
+    collection itself exists and `total`/`pages` tell the client where it ends.
+    """
     result = db.paginate(
         statement, page=args["page"], per_page=args["per_page"], error_out=False
     )
@@ -184,6 +250,9 @@ class User(db.Model):
     role = db.Column(db.String(6), nullable=False, default="User")
     active = db.Column(db.Boolean, nullable=False, default=True)
 
+    # Deleting an account deletes its travel plans (SQLite doesn't enforce FKs, the ORM does)
+    travel_plans = db.relationship("TravelPlan", cascade="all, delete-orphan")
+
     def to_dict(self):
         return {
             "id": self.id,
@@ -200,7 +269,12 @@ class User(db.Model):
         return cls.query.filter_by(username=username).first()
 
 
-# Airline
+# Airline / Airport / Route mirror the CSV columns one-to-one, because the files define the
+# expected schema. Their ids come from the files (autoincrement=False) so that ids stay stable
+# across re-imports and travel plans can keep referring to routes by route_id.
+# Note: SQLite does not enforce foreign keys unless PRAGMA foreign_keys is switched on, so the
+# ForeignKey declarations below document the relationships; referential integrity is enforced
+# by the import validation in Requirement Set 2 instead.
 class Airline(db.Model):
     __tablename__ = "airlines"
 
@@ -248,7 +322,11 @@ class Route(db.Model):
     stops = db.Column(db.Integer, nullable=False)
     equipment = db.Column(db.Text, nullable=False)
 
-    # Read-only links to the related rows (imports write the id columns directly)
+    # Read-only links to the related rows (imports write the id columns directly).
+    # lazy="joined" loads them in the same query as the route, so a page of 100 routes is one
+    # query rather than 1 + 300; viewonly because they are never written through the ORM.
+    # airline_iata/origin_iata/destination_iata duplicate the related codes on purpose: they
+    # are part of the CSV schema, the import guarantees they match, and RS3 filters on them.
     airline = db.relationship("Airline", lazy="joined", viewonly=True)
     origin = db.relationship(
         "Airport", foreign_keys=[origin_airport_id], lazy="joined", viewonly=True
@@ -257,8 +335,53 @@ class Route(db.Model):
         "Airport", foreign_keys=[destination_airport_id], lazy="joined", viewonly=True
     )
 
+
+# Travel plan (private to its owner)
+class TravelPlan(db.Model):
+    __tablename__ = "travel_plans"
+    __table_args__ = {"sqlite_autoincrement": True}
+
+    id = db.Column(db.Integer, primary_key=True)
+    owner_id = db.Column(
+        db.Integer, db.ForeignKey("users.id"), nullable=False, index=True
+    )
+    # Not unique: different accounts (or the same one) may reuse a name
+    name = db.Column(db.String(100), nullable=False)
+    departure_date = db.Column(db.Date, nullable=False)
+    return_date = db.Column(db.Date, nullable=False)
+
+    route_links = db.relationship(
+        "TravelPlanRoute", cascade="all, delete-orphan", lazy="selectin"
+    )
+
+    @property
+    def route_ids(self):
+        return sorted(link.route_id for link in self.route_links)
+
+    @property
+    def routes(self):
+        return sorted(
+            (link.route for link in self.route_links), key=lambda r: r.route_id
+        )
+
+
+# Many-to-many link between travel plans and routes. One plan has many routes and one route can
+# be in many plans, so the plan's metadata lives once in travel_plans and each (plan, route)
+# pair is one row here. The composite primary key makes a route appear at most once per plan.
+class TravelPlanRoute(db.Model):
+    __tablename__ = "travel_plan_routes"
+
+    plan_id = db.Column(db.Integer, db.ForeignKey("travel_plans.id"), primary_key=True)
+    route_id = db.Column(db.Integer, db.ForeignKey("routes.route_id"), primary_key=True)
+
+    # Read-only: the route row (with its airline and airports) for exports
+    route = db.relationship("Route", lazy="joined", viewonly=True)
+
+
 # Initiate SQLite database on first start-up,
-# reuse existing database i.e: app.db for subsequent run
+# reuse existing database i.e: app.db for subsequent run.
+# create_all() only creates tables that are missing (it never drops data), and the seeding is
+# skipped once `admin` exists, so restarting the server keeps every account and record.
 with app.app_context():
     db.create_all()
 
@@ -281,6 +404,9 @@ with app.app_context():
 # ----------------------------------
 # Model Schema for API documentation
 # ----------------------------------
+# strict=True turns into "additionalProperties: false" in the JSON schema, so with
+# @expect(..., validate=True) unknown fields (e.g. a client sending "role": "Admin") are
+# rejected with 400 instead of being silently ignored.
 user_create_model = user_ns.model(
     "UserCreate",
     {
@@ -324,6 +450,7 @@ user_response_model = user_ns.model(
     },
     strict=True,
 )
+
 
 def page_model(ns, name, key, item_model):
     """Offset-based pagination shared by every list endpoint."""
@@ -413,6 +540,9 @@ class Login(Resource):
         existing_user = User.retrieve_user_by_username(
             username=user_data.get("username").strip()
         )
+        # Unknown username and wrong password give the same message, so the endpoint cannot be
+        # used to find out which usernames exist. The activation check comes after the password
+        # check for the same reason: only the real owner learns the account is deactivated.
         if existing_user is None:
             auth_ns.abort(401, "Invalid username or password")
 
@@ -422,6 +552,9 @@ class Login(Resource):
         if not existing_user.active:
             auth_ns.abort(403, "Deactivated account cannot access internal service")
 
+        # The identity is the numeric id (as a string, which PyJWT requires for "sub"), not the
+        # username: ids are never reused, so a token of a deleted account cannot silently start
+        # working for a new account created later with the same username.
         access_token = create_access_token(
             identity=str(existing_user.id),
             additional_claims={
@@ -520,7 +653,7 @@ class UserItem(Resource):
         return target_user, 200
 
     @user_ns.doc(
-        description="Delete a user with specified ID.\n\n**Access:** Admin only"
+        description="Delete a user with specified ID, together with all of their travel plans.\n\n**Access:** Admin only"
     )
     @user_ns.response(204, "Deleted this user")
     @user_ns.response(401, "Unauthorised access, please log in")
@@ -575,6 +708,8 @@ class UserItem(Resource):
 # -------------------------------------------------------------
 MODELS = {"airlines": Airline, "airports": Airport, "routes": Route}
 
+# Expected schema of each file, taken from the provided samples:
+#   column -> (type, required). Column order is not enforced, only the set of names.
 SCHEMAS = {
     "airlines": {
         "airline_id": ("int", True),
@@ -616,6 +751,10 @@ UNIQUE = {
     "routes": ["route_id"],
 }
 
+# How a route refers to other datasets. Each tuple reads:
+#   (route id column, route code column, referenced dataset, its id column, its code column)
+# e.g. a route's origin_airport_id must exist in airports.airport_id, and origin_iata must equal
+# that airport's iata_code.
 ROUTE_LINKS = [
     ("airline_id", "airline_iata", "airlines", "airline_id", "iata_code"),
     ("origin_airport_id", "origin_iata", "airports", "airport_id", "iata_code"),
@@ -631,6 +770,9 @@ ROUTE_LINKS = [
 # Reuse last assignment (i.e: assignment 1)
 RANGES = {"latitude": (-90, 90), "longitude": (-180, 180), "stops": (0, 99)}
 
+# Types are checked with regexes on the raw text rather than by letting pandas guess them, so a
+# bad value produces a precise message ("'altitude' must be int, found 'high' at line 7")
+# instead of a whole column silently becoming text or NaN.
 INT_REGEX = r"[+-]?\d+"
 FLOAT_REGEX = r"[+-]?\d+(\.\d+)?"
 
@@ -671,10 +813,12 @@ import_response_model = dataset_ns.model(
 class ImportValidationError(Exception):
     """Raised for any problem with an upload; carries the HTTP status to return."""
 
-    def __init__(self, message, status=400):
+    def __init__(self, message, status=400, **details):
         super().__init__(message)
         self.message = message
         self.status = status
+        # Extra keys added to the JSON error body
+        self.details = details
 
 
 def dataset_name_matcher(file):
@@ -699,6 +843,10 @@ def parse_and_validate_uploaded_file(name, file):
             f"{name}: expected a .csv file, got '{file.filename}'"
         )
 
+    # dtype=str + keep_default_na=False: read every cell as the exact text in the file, so empty
+    # cells stay "" (not NaN) and the type checks below see what the user actually wrote.
+    # utf-8-sig strips the byte-order mark Excel adds, which would otherwise corrupt the first
+    # column name.
     try:
         df = pd.read_csv(
             file.stream, dtype=str, keep_default_na=False, encoding="utf-8-sig"
@@ -719,6 +867,8 @@ def parse_and_validate_uploaded_file(name, file):
     if df.empty:
         raise ImportValidationError(f"{name}.csv contains no data rows")
 
+    # Error messages give the line number in the file: index + 2, because the index starts at 0
+    # and line 1 is the header. Only the first problem is reported, which keeps messages short.
     for col, (type, required) in schema.items():
         s = df[col].str.strip()
         blank = s == ""
@@ -806,6 +956,9 @@ def check_integrity(frames):
                 409,
             )
 
+        # 400 when the uploaded routes file contradicts itself/its references (a bad file);
+        # 409 when stored routes would clash with a newly uploaded airports/airlines file
+        # (a conflict with existing data rather than a malformed request).
         mismatch = routes[id_col].map(ref) != routes[iata_col]
         if mismatch.any():
             bad = routes[mismatch].iloc[0]
@@ -819,6 +972,10 @@ def check_integrity(frames):
 
 def replace_data(frames):
     """Replace the uploaded datasets inside ONE transaction (adhere to atomicity principle as required by the spec)."""
+    # Everything runs in the session's single transaction and is committed once at the end; any
+    # error rolls back, so the database is either fully updated or untouched.
+    # Deletes go child-first (routes before the datasets they reference) and inserts go
+    # parent-first, so no intermediate state has routes pointing at missing rows.
     try:
         for name in ("routes", "airports", "airlines"):
             if name in frames:
@@ -826,6 +983,7 @@ def replace_data(frames):
 
         for name in ("airlines", "airports", "routes"):
             if name in frames:
+                # Empty optional cells (e.g. codeshare) are stored as NULL, not ""
                 records = [
                     {k: (None if v == "" else v) for k, v in row.items()}
                     for row in frames[name].to_dict("records")
@@ -839,12 +997,39 @@ def replace_data(frames):
 
 
 def check_travel_plans(frames):
-    """Requirement Set 4 hook. Policy: reject (409) a routes import that would remove
-    any route_id still used by a travel plan; routes are matched by route_id only.
+    """Reject (409) a routes import that would remove any route_id still used by a travel plan.
 
-    TODO: once travel plans exist, compare the route ids used by plans with
-    frames["routes"]["route_id"] and raise ImportValidationError(..., 409) listing the missing ids.
+    Routes are matched by route_id only. The error names the affected accounts and how many
+    of their plans are affected (never plan contents), so the admin can ask them to clean up.
     """
+    if "routes" not in frames:
+        return
+
+    new_route_ids = set(frames["routes"]["route_id"])
+    rows = db.session.execute(
+        db.select(TravelPlanRoute.route_id, TravelPlan.id, User.username)
+        .join(TravelPlan, TravelPlanRoute.plan_id == TravelPlan.id)
+        .join(User, TravelPlan.owner_id == User.id)
+    ).all()
+    affected = [row for row in rows if row.route_id not in new_route_ids]
+    if not affected:
+        return
+
+    missing_route_ids = sorted({row.route_id for row in affected})
+    plans_per_user = Counter(
+        username for username, _ in {(row.username, row.id) for row in affected}
+    )
+    raise ImportValidationError(
+        f"Import would remove {len(missing_route_ids)} route(s) still used by "
+        f"{sum(plans_per_user.values())} travel plan(s). The affected accounts must remove "
+        "these routes from their plans before routes.csv can be re-uploaded.",
+        409,
+        missing_route_ids=missing_route_ids,
+        affected_accounts=[
+            {"username": name, "plans": count}
+            for name, count in sorted(plans_per_user.items())
+        ],
+    )
 
 
 @dataset_ns.route("")
@@ -861,12 +1046,14 @@ class FileUpload(Resource):
             "id/iata consistency) before anything is written, referential integrity is checked "
             "on the combined result of the request, and the import is atomic.\n\n"
             "**Existing travel plans:** an import that includes `routes.csv` is **rejected with 409** "
-            "if any travel plan (of any account) references a `route_id` that is not in the new file; "
-            "the response lists the missing route ids and nothing is changed. Routes are matched by "
+            "if any travel plan (of any account) references a `route_id` that is not in the new file. "
+            "Nothing is changed, and the response lists `missing_route_ids` and `affected_accounts` "
+            "(username + number of affected plans, never plan contents, so plans stay private). "
+            "The admin cannot edit other users' plans, so the owners must remove those routes first; "
+            "the admin then uploads the file again (rejected uploads are not kept). Routes are matched by "
             "`route_id` only, so a route that keeps its id but changes details stays in the plans. "
-            "Because plans are private, the admin cannot edit other users' plans: the owners must "
-            "remove those routes first. Imports of only `airports.csv` / `airlines.csv` cannot remove "
-            "routes, so they are never blocked by travel plans.\n\n"
+            "Imports of only `airports.csv` / `airlines.csv` cannot remove routes, so they are never "
+            "blocked by travel plans.\n\n"
             "**Access:** Admin only"
         )
     )
@@ -880,6 +1067,9 @@ class FileUpload(Resource):
     @dataset_ns.response(409, "Referential integrity (or travel plan) conflict")
     def post(self):
         """Import airports, airlines and/or routes from CSV files"""
+        # Phase 1 validates everything (each file, cross-file integrity, travel plans) without
+        # touching the database; phase 2 writes only if all of it passed. dataset_ns.abort()
+        # raises, so `frames` is always defined when phase 2 runs.
         try:
             uploads = {}
 
@@ -904,7 +1094,7 @@ class FileUpload(Resource):
             check_integrity(frames)
             check_travel_plans(frames)
         except ImportValidationError as e:
-            dataset_ns.abort(e.status, e.message)
+            dataset_ns.abort(e.status, e.message, **e.details)
 
         try:
             replace_data(frames)
@@ -917,6 +1107,7 @@ class FileUpload(Resource):
             "message": "Import successful",
             "imported": {name: len(df) for name, df in frames.items()},
         }, 200
+
 
 # --------------------------------------------------------------------------------
 # Requirement Set 3: Access data/info about imported Airports, Airlines and Routes
@@ -934,7 +1125,11 @@ MATCHING_NOTE = (
 
 # ---- Response models ----
 # Small summaries embedded in routes so a client sees names without extra calls,
-# plus an href to follow for the full record
+# plus an href to follow for the full record.
+# Links are computed per object with `attribute=lambda obj: ...` and api.url_for(): the URL is
+# built from the Resource class at request time, so it always matches the real route (prefix
+# included) and the classes can be defined further down the file. Clients navigate by these
+# links instead of building URLs from database ids themselves.
 airport_summary_model = airport_ns.model(
     "AirportSummary",
     {
@@ -997,6 +1192,7 @@ airport_model = airport_ns.model(
         "longitude": fields.Float(description="Longitude in degrees"),
         "altitude": fields.Integer(description="Altitude in feet"),
         "timezone": fields.String(description="IANA timezone, e.g. Australia/Sydney"),
+        # attribute=lambda a: a passes the airport itself to the nested links model
         "_links": fields.Nested(
             airport_links_model,
             attribute=lambda a: a,
@@ -1202,6 +1398,8 @@ class AirportAirlines(Resource):
         if db.session.get(Airport, airport_id) is None:
             airport_ns.abort(404, f"Airport {airport_id} not found")
 
+        # "Operating from" = has at least one route departing this airport. A sub-query with IN
+        # returns each airline once, however many routes it flies from here.
         departing_airlines = db.select(Route.airline_id).where(
             Route.origin_airport_id == airport_id
         )
@@ -1298,6 +1496,8 @@ class RouteList(Resource):
         args = route_list_parser.parse_args()
         statement = db.select(Route).order_by(Route.route_id)
 
+        # Code filters compare against the route's own IATA columns (guaranteed consistent with
+        # the airline/airport tables by the import), which avoids joins for the common lookups.
         for arg, col in (
             ("airline", Route.airline_iata),
             ("origin", Route.origin_iata),
@@ -1305,6 +1505,8 @@ class RouteList(Resource):
         ):
             if args[arg]:
                 statement = statement.where(col == args[arg].strip().upper())
+        # .has() turns into an EXISTS sub-query on the related airport. Origin and destination
+        # both point at the airports table, so a plain join would need table aliases.
         if args["origin_country"]:
             statement = statement.where(
                 Route.origin.has(contains(Airport.country, args["origin_country"]))
@@ -1315,13 +1517,16 @@ class RouteList(Resource):
                     contains(Airport.country, args["destination_country"])
                 )
             )
+        # `is not None` because false is a meaningful filter value ("routes with stops only")
         if args["direct"] is not None:
             statement = statement.where(
                 Route.stops == 0 if args["direct"] else Route.stops > 0
             )
         if args["codeshare"] is not None:
             statement = statement.where(
-                Route.codeshare == "Y" if args["codeshare"] else Route.codeshare.is_(None)
+                Route.codeshare == "Y"
+                if args["codeshare"]
+                else Route.codeshare.is_(None)
             )
         if args["equipment"]:
             statement = statement.where(
@@ -1352,6 +1557,642 @@ class RouteItem(Resource):
             route_ns.abort(404, f"Route {route_id} not found")
 
         return route, 200
+
+
+# ----------------------------------------------
+# Requirement Set 4: My Travel Plans (private)
+# ----------------------------------------------
+PLAN_ACCESS = (
+    "\n\n**Access:** any active account (Admin or User). Plans are private: you only ever see "
+    "your own, and the admin has no access to other accounts' plans. A plan that does not "
+    "belong to you returns **404**, exactly like a plan that does not exist, so plan ids of "
+    "other accounts cannot be discovered."
+)
+
+
+def get_own_plan_or_404(plan_id):
+    """Return the caller's plan, or 404 if it doesn't exist or belongs to someone else.
+
+    Ownership is part of the query itself rather than checked afterwards, so there is no code
+    path that loads another account's plan. This applies to the admin too (spec RS1/RS4).
+    """
+    plan = db.session.scalars(
+        db.select(TravelPlan).where(
+            TravelPlan.id == plan_id, TravelPlan.owner_id == g.current_user.id
+        )
+    ).first()
+    if plan is None:
+        plan_ns.abort(404, f"Travel plan {plan_id} not found")
+    return plan
+
+
+def parse_date(value, field):
+    """Parse a YYYY-MM-DD string (Swagger's date format is not enforced by validation)."""
+    try:
+        return date.fromisoformat(value)
+    except (TypeError, ValueError):
+        plan_ns.abort(
+            400, f"'{field}' must be a date in YYYY-MM-DD format, got '{value}'"
+        )
+
+
+def check_dates(departure_date, return_date):
+    if return_date < departure_date:
+        plan_ns.abort(400, "'return_date' must not be earlier than 'departure_date'")
+
+
+def check_route_ids_exist(route_ids):
+    found = set(
+        db.session.scalars(
+            db.select(Route.route_id).where(Route.route_id.in_(route_ids))
+        )
+    )
+    unknown = sorted(set(route_ids) - found)
+    if unknown:
+        plan_ns.abort(400, f"Unknown route id(s): {unknown}")
+
+
+def clean_name(value):
+    name = value.strip()
+    if not name:
+        plan_ns.abort(400, "'name' must not be blank")
+    return name
+
+
+# ---- Request / response models ----
+plan_create_model = plan_ns.model(
+    "TravelPlanCreate",
+    {
+        "name": fields.String(
+            required=True, min_length=1, max_length=100, description="Plan name"
+        ),
+        "departure_date": fields.Date(
+            required=True, description="Travel departure date (YYYY-MM-DD)"
+        ),
+        "return_date": fields.Date(
+            required=True,
+            description="Travel return date (YYYY-MM-DD), not earlier than departure_date",
+        ),
+        "route_ids": fields.List(
+            fields.Integer,
+            description="Optional initial routes (ids from GET /routes); duplicates are ignored",
+        ),
+    },
+    strict=True,
+)
+
+plan_update_model = plan_ns.model(
+    "TravelPlanUpdate",
+    {
+        "name": fields.String(
+            min_length=1, max_length=100, description="New plan name"
+        ),
+        "departure_date": fields.Date(description="New departure date (YYYY-MM-DD)"),
+        "return_date": fields.Date(description="New return date (YYYY-MM-DD)"),
+    },
+    strict=True,
+)
+
+plan_links_model = plan_ns.model(
+    "TravelPlanLinks",
+    {
+        "self": fields.String(
+            attribute=lambda p: api.url_for(TravelPlanItem, plan_id=p.id)
+        ),
+        "routes": fields.String(
+            attribute=lambda p: api.url_for(TravelPlanRouteList, plan_id=p.id),
+            description="Full details of the plan's routes, with their airlines and airports",
+        ),
+    },
+)
+
+plan_model = plan_ns.model(
+    "TravelPlan",
+    {
+        "id": fields.Integer(description="Travel plan id"),
+        "name": fields.String(description="Plan name"),
+        "departure_date": fields.Date(description="Travel departure date"),
+        "return_date": fields.Date(description="Travel return date"),
+        "route_ids": fields.List(
+            fields.Integer, description="Ids of the routes in this plan"
+        ),
+        "_links": fields.Nested(
+            plan_links_model, attribute=lambda p: p, description="Related resources"
+        ),
+    },
+)
+
+plan_page_model = page_model(plan_ns, "TravelPlanPage", "travel_plans", plan_model)
+plan_list_parser = pagination_parser.copy()
+
+
+@plan_ns.route("")
+class TravelPlanList(Resource):
+    method_decorators = [require_roles(UserRole.ADMIN, UserRole.USER)]
+
+    @plan_ns.expect(plan_list_parser)
+    @plan_ns.doc(
+        description="Retrieve a page of your travel plans ordered by departure date. "
+        "Each plan lists its `route_ids`; follow `_links.routes` for full route, airline and "
+        "airport details." + PLAN_ACCESS
+    )
+    @plan_ns.marshal_with(plan_page_model, code=200)
+    @plan_ns.response(200, "A page of your travel plans")
+    @plan_ns.response(400, "Invalid page or per_page")
+    @plan_ns.response(401, "Unauthorised access, please log in")
+    @plan_ns.response(403, "Deactivated account")
+    def get(self):
+        """Retrieve your travel plans"""
+        args = plan_list_parser.parse_args()
+        statement = (
+            db.select(TravelPlan)
+            .where(TravelPlan.owner_id == g.current_user.id)
+            .order_by(TravelPlan.departure_date, TravelPlan.id)
+        )
+        return paginate(statement, args, "travel_plans"), 200
+
+    @plan_ns.expect(plan_create_model, validate=True)
+    @plan_ns.doc(
+        description="Create a travel plan owned by you. Dates use `YYYY-MM-DD`; past dates are "
+        "allowed, but `return_date` must not be earlier than `departure_date`. `route_ids` is "
+        "optional; routes can also be added later with `PUT /travel-plans/{plan_id}/routes/{route_id}`. "
+        "The response has a `Location` header pointing to the new plan." + PLAN_ACCESS
+    )
+    @plan_ns.marshal_with(plan_model, code=201)
+    @plan_ns.response(201, "Travel plan created")
+    @plan_ns.response(400, "Invalid payload, dates or unknown route ids")
+    @plan_ns.response(401, "Unauthorised access, please log in")
+    @plan_ns.response(403, "Deactivated account")
+    def post(self):
+        """Create a travel plan"""
+        data = plan_ns.payload
+        departure_date = parse_date(data["departure_date"], "departure_date")
+        return_date = parse_date(data["return_date"], "return_date")
+        check_dates(departure_date, return_date)
+
+        # A plan holds a *set* of routes, so duplicate ids in the request are simply merged
+        route_ids = sorted(set(data.get("route_ids") or []))
+        check_route_ids_exist(route_ids)
+
+        plan = TravelPlan(
+            owner_id=g.current_user.id,
+            name=clean_name(data["name"]),
+            departure_date=departure_date,
+            return_date=return_date,
+            route_links=[TravelPlanRoute(route_id=rid) for rid in route_ids],
+        )
+        db.session.add(plan)
+        db.session.commit()
+
+        # Location header: standard for 201, tells the client where the new resource lives
+        return plan, 201, {"Location": api.url_for(TravelPlanItem, plan_id=plan.id)}
+
+
+@plan_ns.route("/<int:plan_id>")
+@plan_ns.param("plan_id", "The travel plan's unique ID")
+class TravelPlanItem(Resource):
+    method_decorators = [require_roles(UserRole.ADMIN, UserRole.USER)]
+
+    @plan_ns.doc(description="Retrieve one of your travel plans." + PLAN_ACCESS)
+    @plan_ns.marshal_with(plan_model, code=200)
+    @plan_ns.response(200, "Travel plan details")
+    @plan_ns.response(401, "Unauthorised access, please log in")
+    @plan_ns.response(403, "Deactivated account")
+    @plan_ns.response(404, "Travel plan not found")
+    def get(self, plan_id):
+        """Retrieve a specific travel plan"""
+        return get_own_plan_or_404(plan_id), 200
+
+    @plan_ns.expect(plan_update_model, validate=True)
+    @plan_ns.doc(
+        description="Update the name and/or dates of one of your travel plans. Send only the "
+        "fields to change; the date rule is checked against the resulting dates. Routes are "
+        "managed through `/travel-plans/{plan_id}/routes`." + PLAN_ACCESS
+    )
+    @plan_ns.marshal_with(plan_model, code=200)
+    @plan_ns.response(200, "Travel plan updated")
+    @plan_ns.response(400, "Empty payload or invalid dates")
+    @plan_ns.response(401, "Unauthorised access, please log in")
+    @plan_ns.response(403, "Deactivated account")
+    @plan_ns.response(404, "Travel plan not found")
+    def patch(self, plan_id):
+        """Update a travel plan"""
+        plan = get_own_plan_or_404(plan_id)
+        data = plan_ns.payload
+        if not data:
+            plan_ns.abort(
+                400, "Provide at least one of: name, departure_date, return_date"
+            )
+
+        # Validate the dates the plan would end up with: changing only one date must still keep
+        # return_date >= departure_date with the other, unchanged date.
+        departure_date = plan.departure_date
+        return_date = plan.return_date
+        if "departure_date" in data:
+            departure_date = parse_date(data["departure_date"], "departure_date")
+        if "return_date" in data:
+            return_date = parse_date(data["return_date"], "return_date")
+        check_dates(departure_date, return_date)
+
+        if "name" in data:
+            plan.name = clean_name(data["name"])
+        plan.departure_date = departure_date
+        plan.return_date = return_date
+        db.session.commit()
+
+        return plan, 200
+
+    @plan_ns.doc(
+        description="Delete one of your travel plans (routes themselves are not affected)."
+        + PLAN_ACCESS
+    )
+    @plan_ns.response(204, "Travel plan deleted")
+    @plan_ns.response(401, "Unauthorised access, please log in")
+    @plan_ns.response(403, "Deactivated account")
+    @plan_ns.response(404, "Travel plan not found")
+    def delete(self, plan_id):
+        """Delete a travel plan"""
+        db.session.delete(get_own_plan_or_404(plan_id))
+        db.session.commit()
+
+        return "", 204
+
+
+@plan_ns.route("/<int:plan_id>/routes")
+@plan_ns.param("plan_id", "The travel plan's unique ID")
+class TravelPlanRouteList(Resource):
+    method_decorators = [require_roles(UserRole.ADMIN, UserRole.USER)]
+
+    @plan_ns.expect(pagination_parser)
+    @plan_ns.doc(
+        description="Retrieve a page of the routes in one of your plans, ordered by route id. "
+        "Each route embeds its airline, origin and destination with an `href` to the full "
+        "record, in the same format as `GET /routes`." + PLAN_ACCESS
+    )
+    @plan_ns.marshal_with(route_page_model, code=200)
+    @plan_ns.response(200, "A page of the plan's routes")
+    @plan_ns.response(400, "Invalid page or per_page")
+    @plan_ns.response(401, "Unauthorised access, please log in")
+    @plan_ns.response(403, "Deactivated account")
+    @plan_ns.response(404, "Travel plan not found")
+    def get(self, plan_id):
+        """Retrieve the routes in a travel plan"""
+        args = pagination_parser.parse_args()
+        plan = get_own_plan_or_404(plan_id)
+        statement = (
+            db.select(Route)
+            .join(TravelPlanRoute, TravelPlanRoute.route_id == Route.route_id)
+            .where(TravelPlanRoute.plan_id == plan.id)
+            .order_by(Route.route_id)
+        )
+        return paginate(statement, args, "routes"), 200
+
+
+@plan_ns.route("/<int:plan_id>/routes/<int:route_id>")
+@plan_ns.param("plan_id", "The travel plan's unique ID")
+@plan_ns.param("route_id", "The route's unique ID (from GET /routes)")
+class TravelPlanRouteItem(Resource):
+    method_decorators = [require_roles(UserRole.ADMIN, UserRole.USER)]
+
+    @plan_ns.doc(
+        description="Add a route to one of your plans. Idempotent: adding a route that is "
+        "already in the plan changes nothing and still returns 200." + PLAN_ACCESS
+    )
+    @plan_ns.marshal_with(plan_model, code=200)
+    @plan_ns.response(200, "Route is in the plan; returns the updated plan")
+    @plan_ns.response(401, "Unauthorised access, please log in")
+    @plan_ns.response(403, "Deactivated account")
+    @plan_ns.response(404, "Travel plan or route not found")
+    # PUT on the member URL (rather than POST to the collection) because adding a route is
+    # idempotent: the client names the exact route, and repeating the request changes nothing.
+    def put(self, plan_id, route_id):
+        """Add a route to a travel plan"""
+        plan = get_own_plan_or_404(plan_id)
+        if db.session.get(Route, route_id) is None:
+            plan_ns.abort(404, f"Route {route_id} not found")
+
+        if route_id not in plan.route_ids:
+            plan.route_links.append(TravelPlanRoute(route_id=route_id))
+            db.session.commit()
+
+        return plan, 200
+
+    @plan_ns.doc(
+        description="Remove a route from one of your plans (the route itself is not deleted)."
+        + PLAN_ACCESS
+    )
+    @plan_ns.response(204, "Route removed from the plan")
+    @plan_ns.response(401, "Unauthorised access, please log in")
+    @plan_ns.response(403, "Deactivated account")
+    @plan_ns.response(404, "Travel plan not found, or route not in this plan")
+    def delete(self, plan_id, route_id):
+        """Remove a route from a travel plan"""
+        plan = get_own_plan_or_404(plan_id)
+        link = next((l for l in plan.route_links if l.route_id == route_id), None)
+        if link is None:
+            plan_ns.abort(404, f"Route {route_id} is not in travel plan {plan_id}")
+
+        plan.route_links.remove(link)
+        db.session.commit()
+
+        return "", 204
+
+
+# ---------------------------------------------
+# Requirement Set 5: Exporting travel plans
+# ---------------------------------------------
+EXPORT_FORMATS = ("json", "png")
+# The visualisation shows at most this many upcoming plans (as required by the spec)
+MAX_PLANS_IN_IMAGE = 5
+# Routes listed under each plan in the image before collapsing into "+N more"
+MAX_ROUTES_IN_LABEL = 3
+
+# The file must be self-contained, so airlines and airports are exported in full and
+# without `_links`/`href` (relative API URLs mean nothing once the file is downloaded)
+export_airline_model = export_ns.model(
+    "ExportAirline", {k: v for k, v in airline_model.items() if k != "_links"}
+)
+export_airport_model = export_ns.model(
+    "ExportAirport", {k: v for k, v in airport_model.items() if k != "_links"}
+)
+
+export_route_model = export_ns.model(
+    "ExportRoute",
+    {
+        "route_id": fields.Integer(description="Route id"),
+        "airline": fields.Nested(
+            export_airline_model, description="Full airline record"
+        ),
+        "origin": fields.Nested(
+            export_airport_model, description="Full departure airport record"
+        ),
+        "destination": fields.Nested(
+            export_airport_model, description="Full arrival airport record"
+        ),
+        "codeshare": route_model["codeshare"],
+        "stops": route_model["stops"],
+        "equipment": route_model["equipment"],
+    },
+)
+
+export_plan_model = export_ns.model(
+    "ExportTravelPlan",
+    {
+        "id": fields.Integer(description="Travel plan id"),
+        "name": fields.String(description="Plan name"),
+        "departure_date": fields.Date(description="Travel departure date"),
+        "return_date": fields.Date(description="Travel return date"),
+        "routes": fields.List(
+            fields.Nested(export_route_model),
+            description="Full details of every route in the plan, ordered by route id",
+        ),
+    },
+)
+
+export_file_model = export_ns.model(
+    "TravelPlanExport",
+    {
+        "owner": fields.String(
+            description="Username of the account that owns the plans"
+        ),
+        "exported_at": fields.DateTime(
+            dt_format="iso8601", description="When the file was generated (UTC)"
+        ),
+        "total_plans": fields.Integer(description="Number of plans in the file"),
+        "travel_plans": fields.List(
+            fields.Nested(export_plan_model),
+            description="All of your plans, ordered by departure date (then id)",
+        ),
+    },
+)
+
+export_parser = reqparse.RequestParser()
+export_parser.add_argument(
+    "format",
+    required=True,
+    choices=EXPORT_FORMATS,
+    location="args",
+    help="Output format (required): `json` = file with all plans, `png` = timeline image "
+    "of the next 5 future plans",
+)
+
+
+def plan_label(plan, today):
+    """Three-line y-axis label: name, dates + countdown, and a short route summary."""
+    days_away = (plan.departure_date - today).days
+    routes = [
+        f"{r.origin.iata_code}\u2192{r.destination.iata_code} ({r.airline.iata_code})"
+        for r in plan.routes
+    ]
+    if not routes:
+        route_text = "No routes added yet"
+    elif len(routes) > MAX_ROUTES_IN_LABEL:
+        route_text = ", ".join(routes[:MAX_ROUTES_IN_LABEL])
+        route_text += f" +{len(routes) - MAX_ROUTES_IN_LABEL} more"
+    else:
+        route_text = ", ".join(routes)
+
+    return (
+        f"{plan.name}\n"
+        f"{plan.departure_date:%d %b %Y} \u2192 {plan.return_date:%d %b %Y} "
+        f"(in {days_away} day{'s' if days_away != 1 else ''})\n"
+        f"{route_text}"
+    )
+
+
+def render_plan_timeline(plans, username, today):
+    """Draw upcoming plans as a Gantt-style timeline and return the PNG bytes.
+
+    Uses matplotlib's object-oriented Figure API rather than pyplot: pyplot keeps global
+    state and needs a GUI backend, which is unsafe inside a multi-threaded web server.
+    """
+    fig = Figure(figsize=(11, 1.4 * len(plans) + 2), dpi=110)
+    ax = fig.add_subplot()
+    colours = ["#2a6fdb", "#e07b39", "#3a9d5d", "#b8457a", "#7a5bc4"]
+
+    for row, plan in enumerate(plans):
+        # +1 so the bar covers the return day too (a same-day trip is still visible)
+        days = (plan.return_date - plan.departure_date).days + 1
+        ax.barh(
+            row,
+            days,
+            left=mdates.date2num(plan.departure_date),
+            height=0.5,
+            color=colours[row % len(colours)],
+        )
+        ax.annotate(
+            f"{days} day{'s' if days != 1 else ''}",
+            xy=(mdates.date2num(plan.return_date) + 1, row),
+            xytext=(4, 0),
+            textcoords="offset points",
+            va="center",
+            fontsize=9,
+        )
+
+    # Mark today so the user sees how far away each trip is
+    ax.axvline(mdates.date2num(today), color="grey", linestyle="--", linewidth=1)
+    ax.annotate(
+        "Today",
+        xy=(mdates.date2num(today), -0.6),
+        xytext=(3, 0),
+        textcoords="offset points",
+        ha="left",
+        fontsize=9,
+        color="grey",
+    )
+
+    ax.set_yticks(range(len(plans)), [plan_label(p, today) for p in plans], fontsize=9)
+    ax.set_ylim(len(plans) - 0.4, -0.9)  # nearest plan at the top
+    ax.xaxis.set_major_locator(mdates.AutoDateLocator())
+    ax.xaxis.set_major_formatter(mdates.DateFormatter("%d %b\n%Y"))
+    # Leave room on the right for the "N days" labels
+    first = mdates.date2num(today) - 3
+    last = mdates.date2num(max(p.return_date for p in plans)) + 1
+    ax.set_xlim(first, last + (last - first) * 0.12)
+    ax.grid(axis="x", alpha=0.3)
+    ax.set_title(
+        f"Next {len(plans)} upcoming travel plan{'s' if len(plans) != 1 else ''} "
+        f"for {username}",
+        fontsize=13,
+        loc="left",
+    )
+    ax.set_xlabel(
+        f"Bars run from departure to return date (inclusive). Generated on {today:%d %b %Y}."
+    )
+
+    buffer = io.BytesIO()
+    fig.savefig(buffer, format="png", bbox_inches="tight")
+    return buffer.getvalue()
+
+
+@export_ns.route("/travel-plans")
+class TravelPlanExport(Resource):
+    method_decorators = [require_roles(UserRole.ADMIN, UserRole.USER)]
+
+    @export_ns.expect(export_parser)
+    @export_ns.produces(["application/json", "image/png"])
+    @export_ns.doc(
+        description=(
+            "Export **your own travel plans**, either as a downloadable JSON file or as a "
+            "timeline image.\n\n"
+            "**Choosing the format:** the client must pass the `format` query parameter: "
+            "`format=json` or `format=png`. A missing or unknown value returns 400 listing the "
+            "supported formats; there is deliberately no default, so a client never receives a "
+            "format it did not ask for. A query parameter is used rather than `Accept` header "
+            "negotiation because it is explicit, visible in the URL, easy to try in Swagger UI "
+            "and from a browser link, and new formats can be added later without changing "
+            "existing clients' URLs.\n\n"
+            "### `format=json`: all plans as a file\n"
+            "All of your plans, ordered by departure date (ties by plan id). "
+            "**File contents:** each plan includes the **full** details of its routes, and each "
+            "route includes its full airline and origin/destination airport records, so the file "
+            "can be used without calling the API again. API links (`href`, `_links`) are left "
+            "out because they are meaningless outside the API. See the `TravelPlanExport` model "
+            "below for the exact structure.\n\n"
+            "**Download:** the response has `Content-Disposition: attachment` with a filename "
+            "like `travel-plans_<username>_<YYYY-MM-DD>.json`, so browsers save it as a file "
+            "(Swagger UI shows a *Download file* link). The whole export is returned in one file, "
+            "so it is not paginated. `Cache-Control: no-store` keeps private plans out of caches.\n\n"
+            "**No plans:** an account without plans still gets 200 and a valid file with "
+            "`total_plans: 0` and an empty `travel_plans` list.\n\n"
+            "### `format=png`: timeline of upcoming plans\n"
+            "A PNG image (`image/png`, `Content-Disposition: inline`, so it is shown in the "
+            "browser rather than downloaded; Swagger UI displays it directly) of up to **5 future "
+            "plans with the nearest departure dates**. A plan is *future* when its departure date "
+            "is strictly **after today** (server date), so a trip departing today is not included.\n\n"
+            "The image is a Gantt-style timeline:\n"
+            "- one horizontal bar per plan, from departure to return date (inclusive), nearest "
+            "plan at the top, with the trip length (`N days`) next to the bar;\n"
+            "- a dashed line marking today, so the gap to each trip is visible;\n"
+            "- each plan's label shows its name, dates, how many days away it is, and its routes "
+            "as `SYD\u2192HND (JL)` (first 3, then `+N more`).\n\n"
+            "**No future plans:** returns **404** with a JSON message (not an empty image), "
+            "because there is nothing to visualise; a client can check the status code before "
+            "showing the image.\n\n"
+            "**Access:** any active account (Admin or User). Only the caller's own plans are "
+            "exported; the admin cannot export other accounts' plans."
+        )
+    )
+    @export_ns.response(
+        200,
+        "`format=json`: JSON file with all of your plans. "
+        "`format=png`: timeline image of your next 5 future plans",
+        export_file_model,
+    )
+    @export_ns.response(400, "Missing or unsupported `format`")
+    @export_ns.response(401, "Unauthorised access, please log in")
+    @export_ns.response(403, "Deactivated account")
+    @export_ns.response(404, "`format=png` only: you have no future travel plans")
+    def get(self):
+        """Export your travel plans as a JSON file or a timeline image"""
+        args = export_parser.parse_args()
+        user = g.current_user
+        if args["format"] == "png":
+            return self.png_timeline(user)
+
+        # Reuses the RS3 field definitions through marshal(), so the export always has the same
+        # field names and formats as GET /airports and GET /airlines.
+
+        plans = db.session.scalars(
+            db.select(TravelPlan)
+            .where(TravelPlan.owner_id == user.id)
+            .order_by(TravelPlan.departure_date, TravelPlan.id)
+        ).all()
+
+        exported_at = datetime.now(UTC)
+        body = marshal(
+            {
+                "owner": user.username,
+                "exported_at": exported_at,
+                "total_plans": len(plans),
+                "travel_plans": plans,
+            },
+            export_file_model,
+        )
+
+        safe_username = "".join(
+            c if c.isalnum() or c in "-_" else "_" for c in user.username
+        )
+        filename = f"travel-plans_{safe_username}_{exported_at:%Y-%m-%d}.json"
+        # A raw Response (instead of returning a dict) so the Content-Disposition header makes
+        # browsers save it as a file; indent=2 keeps the downloaded file human-readable.
+        return Response(
+            json.dumps(body, indent=2),
+            status=200,
+            mimetype="application/json",
+            headers={
+                "Content-Disposition": f'attachment; filename="{filename}"',
+                "Cache-Control": "no-store",
+            },
+        )
+
+    @staticmethod
+    def png_timeline(user):
+        # "Future" means departing strictly after today (server's local date), as in the spec.
+        # The filtering, ordering and the limit of 5 are done in SQL.
+        today = date.today()
+        plans = db.session.scalars(
+            db.select(TravelPlan)
+            .where(TravelPlan.owner_id == user.id, TravelPlan.departure_date > today)
+            .order_by(TravelPlan.departure_date, TravelPlan.id)
+            .limit(MAX_PLANS_IN_IMAGE)
+        ).all()
+        if not plans:
+            export_ns.abort(
+                404,
+                f"You have no future travel plans (departing after {today.isoformat()}) "
+                "to visualise",
+            )
+
+        return Response(
+            render_plan_timeline(plans, user.username, today),
+            status=200,
+            mimetype="image/png",
+            headers={
+                "Content-Disposition": f'inline; filename="travel-plans_{today:%Y-%m-%d}.png"',
+                "Cache-Control": "no-store",
+            },
+        )
 
 
 # ---------------------
