@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Upload Tester</title>
+<style>
+  :root { --bg:#fff; --fg:#1d1d1f; --muted:#666; --border:#ccc; --ok:#1a7f37; --err:#c62828; --code:#f5f5f5; }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg:#161618; --fg:#e8e8ea; --muted:#9a9aa0; --border:#3a3a3f; --ok:#4cc26a; --err:#ff6b6b; --code:#222226; }
+  }
+  body { font: 15px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg); max-width:720px; margin:24px auto; padding:0 16px; }
+  fieldset { border:1px solid var(--border); border-radius:8px; margin-bottom:16px; }
+  label { display:block; margin:6px 0; }
+  input[type=text], input[type=password] { width:100%; box-sizing:border-box; padding:6px; }
+  button { padding:6px 14px; margin-top:8px; cursor:pointer; }
+  .muted { color:var(--muted); font-size:13px; }
+  pre { background:var(--code); padding:12px; border-radius:6px; white-space:pre-wrap; word-break:break-word; }
+  .ok { color:var(--ok); } .err { color:var(--err); }
+</style>
+</head>
+<body>
+<h1>POST /imports tester</h1>
+
+<fieldset>
+  <legend>1. Log in</legend>
+  <label>API base <input type="text" id="base" value="http://127.0.0.1:5000/api/v1"></label>
+  <label>Username <input type="text" id="username" value="admin"></label>
+  <label>Password <input type="password" id="password" value="admin"></label>
+  <button id="login">Log in</button>
+  <div class="muted" id="tokenState">No token yet.</div>
+</fieldset>
+
+<fieldset>
+  <legend>2. Upload (pick any subset)</legend>
+  <label>airports <input type="file" id="airports" accept=".csv"></label>
+  <label>airlines <input type="file" id="airlines" accept=".csv"></label>
+  <label>routes <input type="file" id="routes" accept=".csv"></label>
+  <label><input type="checkbox" id="generic"> Send every file under one generic field name <code>file</code> (tests matching by file name)</label>
+  <button id="upload">Upload</button>
+  <button id="noToken">Upload without token</button>
+</fieldset>
+
+<h2>Response</h2>
+<pre id="out">—</pre>
+
+<script>
+  const $ = (id) => document.getElementById(id);
+  let token = null;
+
+  function show(status, body) {
+    const out = $("out");
+    out.className = status >= 200 && status < 300 ? "ok" : "err";
+    let text = body;
+    try { text = JSON.stringify(JSON.parse(body), null, 2); } catch (e) {}
+    out.textContent = `HTTP ${status}\n\n${text}`;
+  }
+
+  async function send(path, options) {
+    try {
+      const res = await fetch($("base").value.replace(/\/$/, "") + path, options);
+      const body = await res.text();
+      show(res.status, body);
+      return { status: res.status, body };
+    } catch (e) {
+      show(0, `Request failed: ${e.message}\n(Is the API running, with CORS enabled?)`);
+      return { status: 0 };
+    }
+  }
+
+  $("login").onclick = async () => {
+    const { status, body } = await send("/auth/login", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ username: $("username").value, password: $("password").value }),
+    });
+    token = status === 200 ? JSON.parse(body).accessToken : null;
+    $("tokenState").textContent = token ? `Logged in as ${$("username").value}.` : "Login failed, no token.";
+  };
+
+  function buildForm() {
+    const form = new FormData();
+    for (const name of ["airports", "airlines", "routes"]) {
+      const file = $(name).files[0];
+      if (file) form.append($("generic").checked ? "file" : name, file);
+    }
+    return form;
+  }
+
+  $("upload").onclick = () => send("/imports", {
+    method: "POST",
+    headers: token ? { Authorization: `Bearer ${token}` } : {},
+    body: buildForm(),
+  });
+
+  $("noToken").onclick = () => send("/imports", { method: "POST", body: buildForm() });
+</script>
+</body>
+</html>
